@@ -16,19 +16,28 @@ import (
 	"github.com/openai/openai-go/v3/option"
 )
 
+// OpenAI API format values (ModelConfig openAI.apiFormat).
+const (
+	OpenAIAPIFormatChatCompletions = "chatCompletions"
+	OpenAIAPIFormatResponses       = "responses"
+)
+
 // OpenAIConfig holds OpenAI configuration
 type OpenAIConfig struct {
 	TransportConfig
-	Model            string
-	BaseUrl          string
-	FrequencyPenalty *float64
-	MaxTokens        *int
-	N                *int
-	PresencePenalty  *float64
-	ReasoningEffort  *string
-	Seed             *int
-	Temperature      *float64
-	TopP             *float64
+	Model               string
+	BaseUrl             string
+	FrequencyPenalty    *float64
+	MaxTokens           *int
+	MaxCompletionTokens *int
+	N                   *int
+	PresencePenalty     *float64
+	ReasoningEffort     *string
+	Seed                *int
+	Temperature         *float64
+	TopP                *float64
+	// APIFormat selects chatCompletions (default) or responses.
+	APIFormat string
 }
 
 // AzureOpenAIConfig holds Azure OpenAI configuration

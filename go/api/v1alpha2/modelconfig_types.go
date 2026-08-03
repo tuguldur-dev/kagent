@@ -74,6 +74,7 @@ type GeminiVertexAIConfig struct {
 
 	// Maximum output tokens
 	// +optional
+	// +kubebuilder:validation:Minimum=1
 	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
 
 	// Candidate count
@@ -138,6 +139,8 @@ type TokenExchangeConfig struct {
 }
 
 // OpenAIConfig contains OpenAI-specific configuration options
+//
+// +kubebuilder:validation:XValidation:message="maxTokens and maxCompletionTokens are mutually exclusive",rule="!(has(self.maxTokens) && has(self.maxCompletionTokens))"
 type OpenAIConfig struct {
 	// Base URL for the OpenAI API (overrides default)
 	// +optional
@@ -151,9 +154,22 @@ type OpenAIConfig struct {
 	// +optional
 	Temperature string `json:"temperature,omitempty"`
 
-	// Maximum tokens to generate
+	// Maximum tokens to generate. Sent as the OpenAI `max_tokens` request
+	// parameter, which is deprecated and rejected by reasoning models
+	// (GPT-5 / o-series). For those models set maxCompletionTokens instead.
+	// Mutually exclusive with maxCompletionTokens.
 	// +optional
+	// +kubebuilder:validation:Minimum=1
 	MaxTokens int `json:"maxTokens,omitempty"`
+
+	// Maximum completion tokens to generate. Sent as the OpenAI
+	// `max_completion_tokens` request parameter (an upper bound on visible
+	// output plus reasoning tokens). This is the parameter reasoning models
+	// (GPT-5 / o-series) require in place of the deprecated maxTokens.
+	// Mutually exclusive with maxTokens.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxCompletionTokens int `json:"maxCompletionTokens,omitempty"`
 
 	// Top-p sampling parameter
 	// +optional
@@ -183,16 +199,33 @@ type OpenAIConfig struct {
 	// +optional
 	ReasoningEffort *OpenAIReasoningEffort `json:"reasoningEffort,omitempty"`
 
+	// APIFormat selects which OpenAI HTTP API the runtime uses for this model.
+	// chatCompletions (default) posts to /v1/chat/completions.
+	// responses posts to /v1/responses. Use responses for OpenAI-compatible
+	// gateways or models that require the Responses API.
+	// +optional
+	// +kubebuilder:default=chatCompletions
+	APIFormat *OpenAIAPIFormat `json:"apiFormat,omitempty"`
+
 	// TokenExchange configures dynamic bearer token acquisition via credential exchange.
 	// Requires apiKeySecret (used as the service account secret) and is mutually exclusive with apiKeyPassthrough.
 	// +optional
 	TokenExchange *TokenExchangeConfig `json:"tokenExchange,omitempty"`
 }
 
+// OpenAIAPIFormat selects the OpenAI HTTP API shape used by the Go ADK runtime.
+// +kubebuilder:validation:Enum=chatCompletions;responses
+type OpenAIAPIFormat string
+
+const (
+	OpenAIAPIFormatChatCompletions OpenAIAPIFormat = "chatCompletions"
+	OpenAIAPIFormatResponses       OpenAIAPIFormat = "responses"
+)
+
 // OpenAIReasoningEffort represents how many reasoning tokens the model generates before producing a response.
-// Set to "none" to disable reasoning; some models (e.g. gpt-5.6-terra) require this to use
-// function tools via the Chat Completions API.
-// +kubebuilder:validation:Enum=none;minimal;low;medium;high
+// Supported values vary by model. Set to "none" to disable reasoning; some models (e.g. gpt-5.6-terra)
+// require this to use function tools via the Chat Completions API.
+// +kubebuilder:validation:Enum=none;minimal;low;medium;high;xhigh
 type OpenAIReasoningEffort string
 
 // AzureOpenAIConfig contains Azure OpenAI-specific configuration options
@@ -242,7 +275,13 @@ type OllamaConfig struct {
 	Options map[string]string `json:"options,omitempty"`
 }
 
-type GeminiConfig struct{}
+// GeminiConfig contains Gemini (AI Studio, API-key) specific configuration options
+type GeminiConfig struct {
+	// Maximum output tokens to generate for a single response
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
+}
 
 // BedrockConfig contains AWS Bedrock-specific configuration options.
 type BedrockConfig struct {
@@ -294,6 +333,49 @@ type BedrockConfig struct {
 	// +kubebuilder:validation:Enum="5m";"1h"
 	// +kubebuilder:default="5m"
 	CacheTTL string `json:"cacheTTL,omitempty"`
+
+	// +optional
+	Guardrail *BedrockGuardrailConfig `json:"guardrail,omitempty"`
+
+	// ReadTimeout is the Bedrock HTTP client read timeout in seconds, applied by
+	// both the Python and Go ADK runtimes. Raise this for agents that make long
+	// Converse calls (large tool-augmented turns, extended reasoning). On the
+	// Python ADK it overrides botocore's ~60s read timeout, which otherwise
+	// aborts long completions with a ReadTimeoutError; on the Go ADK it bounds
+	// the whole Converse request (default 30m). When unset, each runtime's
+	// default is used.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	ReadTimeout *int `json:"readTimeout,omitempty"`
+
+	// ConnectTimeout is the Bedrock HTTP client connection-establishment timeout
+	// in seconds, applied by both the Python and Go ADK runtimes. It bounds
+	// connection setup only, not the response read. When unset, each runtime's
+	// default is used (Python ADK: botocore; Go ADK: net dialer).
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	ConnectTimeout *int `json:"connectTimeout,omitempty"`
+}
+
+type BedrockGuardrailConfig struct {
+	// Identifier is the guardrail ID or full ARN. AWS accepts either a bare
+	// guardrail ID or an arn:aws:bedrock:...:guardrail/... ARN, so the value is
+	// only length-bounded here (AWS caps guardrailIdentifier at 2048 chars).
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	Identifier string `json:"identifier"`
+
+	// Version is the guardrail version: a numeric version (e.g. "1") or "DRAFT".
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=8
+	Version string `json:"version"`
+
+	// +optional
+	// +kubebuilder:validation:Enum="disabled";"enabled";"enabled_full"
+	// +kubebuilder:default="disabled"
+	Trace string `json:"trace,omitempty"`
 }
 
 // SAPAICoreConfig contains SAP AI Core-specific configuration options.
