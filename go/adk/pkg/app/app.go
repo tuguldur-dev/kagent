@@ -2,21 +2,19 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"strings"
 	"time"
 
-	a2atype "github.com/a2aproject/a2a-go/a2a"
-	"github.com/a2aproject/a2a-go/a2asrv"
+	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	a2ataskstore "github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
 	"github.com/kagent-dev/kagent/go/adk/pkg/a2a"
 	"github.com/kagent-dev/kagent/go/adk/pkg/a2a/server"
-	"github.com/kagent-dev/kagent/go/adk/pkg/auth"
-	"github.com/kagent-dev/kagent/go/adk/pkg/session"
-	"github.com/kagent-dev/kagent/go/adk/pkg/taskstore"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	adkagent "google.golang.org/adk/v2/agent"
@@ -39,10 +37,6 @@ type AppConfig struct {
 	// Port is the port to listen on. Defaults to the PORT env var, then "8080".
 	Port string
 
-	// KAgentURL is the KAgent controller URL for remote session/task persistence.
-	// Defaults to the KAGENT_URL env var. When empty, the app uses no remote persistence.
-	KAgentURL string
-
 	// AppName identifies this application for session and tracing purposes.
 	// Defaults to KAGENT_NAMESPACE__NS__KAGENT_NAME from env, then AgentCard.Name,
 	// then "go-adk-agent".
@@ -54,13 +48,6 @@ type AppConfig struct {
 	// Logger is the structured logger. If nil, a production zap logger is created.
 	Logger logr.Logger
 
-	// HTTPClient overrides the default authenticated HTTP client used for
-	// KAgent API calls (task store, session service). When nil and KAgentURL
-	// is set, the builder creates a new client with K8s token auth.
-	// Provide this when you already manage token auth yourself (e.g. the
-	// declarative image creates its own token service for the executor).
-	HTTPClient *http.Client
-
 	// HandlerOpts are additional a2asrv.RequestHandlerOption values appended
 	// after the ones the builder creates (task store, push notifications, etc.).
 	HandlerOpts []a2asrv.RequestHandlerOption
@@ -70,13 +57,34 @@ type AppConfig struct {
 	Agent adkagent.Agent
 }
 
-// KAgentApp wires an AgentExecutor with kagent infrastructure (auth, session,
-// task store, A2A server) so that BYO users only need to provide their executor.
+// KAgentApp wires an AgentExecutor with kagent's A2A server.
 type KAgentApp struct {
-	server         *server.A2AServer
-	tokenService   *auth.KAgentTokenService
-	sessionService *session.KAgentSessionService
-	logger         logr.Logger
+	server *server.A2AServer
+	logger logr.Logger
+}
+
+type seedTaskInterceptor struct {
+	a2asrv.PassthroughCallInterceptor
+	store a2ataskstore.Store
+}
+
+func (i seedTaskInterceptor) Before(ctx context.Context, _ *a2asrv.CallContext, req *a2asrv.Request) (context.Context, any, error) {
+	if req == nil {
+		return ctx, nil, nil
+	}
+	send, ok := req.Payload.(*a2atype.SendMessageRequest)
+	if !ok || send.Message == nil || send.Message.TaskID == "" {
+		return ctx, nil, nil
+	}
+	if _, err := i.store.Get(ctx, send.Message.TaskID); err == nil {
+		return ctx, nil, nil
+	} else if !errors.Is(err, a2atype.ErrTaskNotFound) {
+		return ctx, nil, fmt.Errorf("load actor task: %w", err)
+	}
+	if _, err := i.store.Create(ctx, a2atype.NewSubmittedTask(send.Message, send.Message)); err != nil && !errors.Is(err, a2ataskstore.ErrTaskAlreadyExists) {
+		return ctx, nil, fmt.Errorf("seed actor task: %w", err)
+	}
+	return ctx, nil, nil
 }
 
 // New creates a KAgentApp by wiring the provided executor with kagent
@@ -90,38 +98,17 @@ func New(cfg AppConfig, executor a2asrv.AgentExecutor) (*KAgentApp, error) {
 
 	log := cfg.Logger
 
-	app := &KAgentApp{
-		logger: log,
-	}
+	app := &KAgentApp{logger: log}
+	tasks := a2ataskstore.NewInMemory(&a2ataskstore.InMemoryStoreConfig{Authenticator: a2asrv.NewTaskStoreAuthenticator()})
+	handlerOpts := []a2asrv.RequestHandlerOption{a2asrv.WithTaskStore(tasks)}
 
-	// Wire remote infrastructure when KAgentURL is configured.
-	var handlerOpts []a2asrv.RequestHandlerOption
-	if cfg.KAgentURL != "" {
-		httpClient := cfg.HTTPClient
-		if httpClient == nil {
-			tokenService := auth.NewKAgentTokenService(cfg.AppName)
-			if err := tokenService.Start(context.Background()); err != nil {
-				log.Error(err, "Failed to start token service")
-			} else {
-				log.Info("Token service started")
-			}
-			app.tokenService = tokenService
-			httpClient = newHTTPClient(tokenService)
-		}
-
-		sessionSvc := session.NewKAgentSessionService(cfg.KAgentURL, httpClient)
-		app.sessionService = sessionSvc
-		log.Info("Using KAgent session service", "url", cfg.KAgentURL)
-
-		taskStore := taskstore.NewKAgentTaskStoreWithClient(cfg.KAgentURL, httpClient)
-		handlerOpts = append(handlerOpts, a2asrv.WithTaskStore(taskStore))
-		log.Info("Using KAgent task store", "url", cfg.KAgentURL)
-	} else {
-		log.Info("No KAgentURL configured, using in-memory session and no task persistence")
-	}
-
-	// Append the user-ID interceptor
-	handlerOpts = append(handlerOpts, a2asrv.WithCallInterceptor(a2a.UserIDCallInterceptor()))
+	// The private runtime receives a gateway-assigned ID for a new task. Seed it
+	// locally so upstream A2A does not mistake that ID for a continuation.
+	handlerOpts = append(handlerOpts, a2asrv.WithCallInterceptors(
+		a2a.HITLActivationInterceptor(),
+		a2a.UserIDCallInterceptor(),
+		seedTaskInterceptor{store: tasks},
+	))
 
 	// Append any caller-supplied handler options.
 	handlerOpts = append(handlerOpts, cfg.HandlerOpts...)
@@ -148,26 +135,12 @@ func New(cfg AppConfig, executor a2asrv.AgentExecutor) (*KAgentApp, error) {
 
 // Run starts the A2A server and blocks until a shutdown signal is received.
 func (a *KAgentApp) Run() error {
-	defer a.stop()
 	return a.server.Run()
-}
-
-// SessionService returns the wired session service. BYO executors that need
-// session persistence can use this. Returns nil when KAgentURL is not configured.
-func (a *KAgentApp) SessionService() *session.KAgentSessionService {
-	return a.sessionService
 }
 
 // Logger returns the logger used by this app.
 func (a *KAgentApp) Logger() logr.Logger {
 	return a.logger
-}
-
-// stop cleans up resources.
-func (a *KAgentApp) stop() {
-	if a.tokenService != nil {
-		a.tokenService.Stop()
-	}
 }
 
 // applyDefaults fills in zero-value fields with sensible defaults.
@@ -177,10 +150,6 @@ func applyDefaults(cfg AppConfig) AppConfig {
 	}
 	if cfg.Port == "" {
 		cfg.Port = defaultPort
-	}
-
-	if cfg.KAgentURL == "" {
-		cfg.KAgentURL = os.Getenv("KAGENT_URL")
 	}
 
 	if cfg.AppName == "" {
@@ -195,11 +164,12 @@ func applyDefaults(cfg AppConfig) AppConfig {
 		cfg.Logger = newDefaultLogger()
 	}
 
-	// Ensure the agent card always advertises a transport so that A2A clients
-	// can select a compatible one. Without this, NewFromCard fails with
-	// "no compatible transports found: available transports - []".
-	if cfg.AgentCard.PreferredTransport == "" {
-		cfg.AgentCard.PreferredTransport = a2atype.TransportProtocolJSONRPC
+	// Ensure the agent card always advertises at least one interface so A2A
+	// clients can select a compatible endpoint/transport.
+	if len(cfg.AgentCard.SupportedInterfaces) == 0 {
+		cfg.AgentCard.SupportedInterfaces = []*a2atype.AgentInterface{
+			a2atype.NewAgentInterface("/", a2atype.TransportProtocolJSONRPC),
+		}
 	}
 
 	return cfg
@@ -222,14 +192,6 @@ func buildAppName(agentCard *a2atype.AgentCard) string {
 	}
 
 	return defaultAppName
-}
-
-// newHTTPClient creates an HTTP client with optional token injection.
-func newHTTPClient(tokenService *auth.KAgentTokenService) *http.Client {
-	if tokenService != nil {
-		return auth.NewHTTPClientWithToken(tokenService)
-	}
-	return &http.Client{Timeout: 30 * time.Second}
 }
 
 // newDefaultLogger creates a production zap logger wrapped as logr.Logger.

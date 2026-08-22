@@ -3,9 +3,13 @@ import type { GitRepo } from "@/types";
 import {
   MAX_SKILLS_PER_SOURCE,
   applyGitSkillUrlPathChange,
+  applyS3SkillUriChange,
   defaultGitSkillFolderName,
+  defaultS3SkillFolderName,
   formRowToGitRepo,
+  formRowToS3Ref,
   formRowsToGitRepos,
+  formRowsToS3Refs,
   gitRepoToFormRow,
   gitSkillDedupeKeyFromFormRow,
   gitSkillDedupeKeyFromRepo,
@@ -14,10 +18,11 @@ import {
   isDuplicateGitSkillFormRow,
   isDuplicateOciSkillRef,
   isPlausibleGitRemoteUrl,
+  isPlausibleS3Uri,
   isValidSkillContainerImage,
   newEmptyGitSkillRow,
+  newEmptyS3SkillRow,
   validateDeclarativeAgentSkills,
-  validateSubstrateSandboxSkillsConflict,
   type GitSkillFormRow,
 } from "../agentSkillsForm";
 
@@ -383,33 +388,67 @@ describe("agentSkillsForm", () => {
         }),
       ).toBeUndefined();
     });
-  });
 
-  describe("validateSubstrateSandboxSkillsConflict", () => {
-    it("rejects skills when running in a sandbox", () => {
-      expect(
-        validateSubstrateSandboxSkillsConflict(
-          {
-            skillRefs: ["ghcr.io/org/skill:v1"],
-            skillGitRepos: [],
-            skillsGitAuthSecretName: "",
-          },
-          true,
-        ),
-      ).toMatch(/not supported for Agent Substrate/);
+    it("errors on invalid S3 URI", () => {
+      const msg = validateDeclarativeAgentSkills({
+        skillRefs: [],
+        skillGitRepos: [newEmptyGitSkillRow()],
+        skillsGitAuthSecretName: "",
+        skillS3Repos: [{ uri: "https://bucket/key", region: "", name: "" }],
+      });
+      expect(msg).toMatch(/Invalid S3 URI/);
     });
 
-    it("allows empty skills on substrate", () => {
+    it("allows a valid S3 skill", () => {
       expect(
-        validateSubstrateSandboxSkillsConflict(
-          {
-            skillRefs: [""],
-            skillGitRepos: [newEmptyGitSkillRow()],
-            skillsGitAuthSecretName: "",
-          },
-          true,
-        ),
+        validateDeclarativeAgentSkills({
+          skillRefs: [],
+          skillGitRepos: [newEmptyGitSkillRow()],
+          skillsGitAuthSecretName: "",
+          skillS3Repos: [
+            { uri: "s3://bucket/team/skill", region: "us-east-1", name: "skill" },
+          ],
+        }),
       ).toBeUndefined();
     });
   });
+
+  describe("S3 skill helpers", () => {
+    it("derives folder name and strips archive extensions", () => {
+      expect(defaultS3SkillFolderName("s3://b/team/kebab-maker")).toBe("kebab-maker");
+      expect(defaultS3SkillFolderName("s3://b/bundles/ops.zip")).toBe("ops");
+      expect(defaultS3SkillFolderName("s3://b/bundles/ops.tar.gz")).toBe("ops");
+    });
+
+    it("updates suggested name when URI changes", () => {
+      const row = applyS3SkillUriChange(newEmptyS3SkillRow(), "s3://b/team/a");
+      expect(row.name).toBe("a");
+      const next = applyS3SkillUriChange(row, "s3://b/team/b");
+      expect(next.name).toBe("b");
+      const custom = applyS3SkillUriChange({ ...row, name: "custom" }, "s3://b/team/c");
+      expect(custom.name).toBe("custom");
+    });
+
+    it("accepts plausible s3 URIs", () => {
+      expect(isPlausibleS3Uri("s3://bucket/key")).toBe(true);
+      expect(isPlausibleS3Uri("s3://bucket")).toBe(false);
+      expect(isPlausibleS3Uri("https://bucket/key")).toBe(false);
+    });
+
+    it("maps form rows", () => {
+      expect(
+        formRowToS3Ref({
+          uri: "s3://bucket/team/skill",
+          region: "eu-west-1",
+          name: "",
+        }),
+      ).toEqual({
+        uri: "s3://bucket/team/skill",
+        region: "eu-west-1",
+        name: "skill",
+      });
+      expect(formRowsToS3Refs([newEmptyS3SkillRow()])).toEqual([]);
+    });
+  });
+
 });

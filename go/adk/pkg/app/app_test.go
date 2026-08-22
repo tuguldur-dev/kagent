@@ -2,23 +2,24 @@ package app
 
 import (
 	"context"
+	"iter"
 	"testing"
 	"time"
 
-	a2atype "github.com/a2aproject/a2a-go/a2a"
-	"github.com/a2aproject/a2a-go/a2asrv"
-	"github.com/a2aproject/a2a-go/a2asrv/eventqueue"
+	a2atype "github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
+	a2ataskstore "github.com/a2aproject/a2a-go/v2/a2asrv/taskstore"
 )
 
 // fakeExecutor implements a2asrv.AgentExecutor for testing.
 type fakeExecutor struct{}
 
-func (f *fakeExecutor) Execute(_ context.Context, _ *a2asrv.RequestContext, _ eventqueue.Queue) error {
-	return nil
+func (f *fakeExecutor) Execute(_ context.Context, _ *a2asrv.ExecutorContext) iter.Seq2[a2atype.Event, error] {
+	return func(yield func(a2atype.Event, error) bool) {}
 }
 
-func (f *fakeExecutor) Cancel(_ context.Context, _ *a2asrv.RequestContext, _ eventqueue.Queue) error {
-	return nil
+func (f *fakeExecutor) Cancel(_ context.Context, _ *a2asrv.ExecutorContext) iter.Seq2[a2atype.Event, error] {
+	return func(yield func(a2atype.Event, error) bool) {}
 }
 
 var _ a2asrv.AgentExecutor = (*fakeExecutor)(nil)
@@ -43,26 +44,20 @@ func TestNew_Success(t *testing.T) {
 	if app == nil {
 		t.Fatal("expected non-nil app")
 	}
-	if app.SessionService() != nil {
-		t.Error("expected nil session service when KAgentURL is empty")
-	}
 }
 
-func TestNew_WithKAgentURL(t *testing.T) {
-	t.Setenv("KAGENT_URL", "")
-
-	app, err := New(AppConfig{
-		AgentCard: a2atype.AgentCard{Name: "test-agent"},
-		Port:      "0",
-		KAgentURL: "http://localhost:9999",
-	}, &fakeExecutor{})
+func TestSeedTaskInterceptor(t *testing.T) {
+	store := a2ataskstore.NewInMemory(nil)
+	message := &a2atype.Message{ID: "message-1", TaskID: "task-1", ContextID: "instance-1", Role: a2atype.MessageRoleUser}
+	interceptor := seedTaskInterceptor{store: store}
+	_, _, err := interceptor.Before(t.Context(), nil, &a2asrv.Request{Payload: &a2atype.SendMessageRequest{Message: message}})
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("Before() error = %v", err)
 	}
-	if app.SessionService() == nil {
-		t.Error("expected non-nil session service when KAgentURL is set")
+	stored, err := store.Get(t.Context(), message.TaskID)
+	if err != nil || stored.Task.ID != message.TaskID || stored.Task.ContextID != message.ContextID || len(stored.Task.History) != 1 {
+		t.Fatalf("stored task = %#v, error = %v", stored, err)
 	}
-	app.stop()
 }
 
 func TestApplyDefaults_Port(t *testing.T) {
@@ -100,22 +95,6 @@ func TestApplyDefaults_ShutdownTimeoutExplicit(t *testing.T) {
 	cfg := applyDefaults(AppConfig{ShutdownTimeout: 10 * time.Second})
 	if cfg.ShutdownTimeout != 10*time.Second {
 		t.Errorf("expected shutdown timeout %v, got %v", 10*time.Second, cfg.ShutdownTimeout)
-	}
-}
-
-func TestApplyDefaults_KAgentURLFromEnv(t *testing.T) {
-	t.Setenv("KAGENT_URL", "http://env-url:8083")
-	cfg := applyDefaults(AppConfig{})
-	if cfg.KAgentURL != "http://env-url:8083" {
-		t.Errorf("expected KAgentURL from env, got %q", cfg.KAgentURL)
-	}
-}
-
-func TestApplyDefaults_KAgentURLExplicit(t *testing.T) {
-	t.Setenv("KAGENT_URL", "http://env-url:8083")
-	cfg := applyDefaults(AppConfig{KAgentURL: "http://explicit:8083"})
-	if cfg.KAgentURL != "http://explicit:8083" {
-		t.Errorf("expected explicit KAgentURL, got %q", cfg.KAgentURL)
 	}
 }
 

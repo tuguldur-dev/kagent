@@ -5,15 +5,30 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
-	"github.com/a2aproject/a2a-go/a2asrv"
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	adkagent "google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/genai"
 )
+
+func TestCreateTransportBuildsStdioCommand(t *testing.T) {
+	dir := t.TempDir()
+	transport, err := createTransport(t.Context(), mcpServerParams{
+		ServerType: "stdio", Command: "server", Args: []string{"--stdio"}, Env: map[string]string{"PLUGIN_ROOT": dir}, Dir: dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdio, ok := transport.(*mcpsdk.CommandTransport)
+	if !ok || filepath.Base(stdio.Command.Path) != "server" || len(stdio.Command.Args) != 2 || stdio.Command.Dir != dir {
+		t.Fatalf("stdio transport = %#v", transport)
+	}
+}
 
 // newTestTransport returns a transport private to the test. These parallel
 // tests must not share newTestTransport(t): httptest.Server.Close (deferred
@@ -27,11 +42,10 @@ func newTestTransport(t *testing.T) http.RoundTripper {
 }
 
 // a2aCtx builds a context that carries an A2A CallContext with the given headers.
-// Keys are stored case-insensitively by NewRequestMeta, matching the behaviour
+// Keys are stored case-insensitively by NewServiceParams, matching the behaviour
 // of a real A2A server.
 func a2aCtx(headers map[string][]string) context.Context {
-	meta := a2asrv.NewRequestMeta(headers)
-	ctx, _ := a2asrv.WithCallContext(context.Background(), meta)
+	ctx, _ := a2asrv.NewCallContext(context.Background(), a2asrv.NewServiceParams(headers))
 	return ctx
 }
 

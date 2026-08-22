@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 import pytest
-from google.adk.agents.remote_a2a_agent import AGENT_CARD_WELL_KNOWN_PATH
+from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 
 from kagent.adk._remote_a2a_tool import KAgentRemoteA2AToolset
 from kagent.adk.types import PROXY_HOST_HEADER, AgentConfig, OpenAI, RemoteAgentConfig
@@ -144,6 +144,26 @@ async def test_remote_agent_with_proxy_url():
             request["headers"].get(PROXY_HOST_HEADER) == "remote-agent.kagent"
             or request["headers"].get(PROXY_HOST_HEADER.lower()) == "remote-agent.kagent"
         )
+
+
+def test_remote_agent_isolate_sessions_is_forwarded_to_toolset():
+    config = AgentConfig(
+        model=OpenAI(model="gpt-3.5-turbo", type="openai", api_key="fake"),
+        description="Test agent",
+        instruction="You are a test agent",
+        remote_agents=[
+            RemoteAgentConfig(
+                name="remote_agent",
+                url="http://remote-agent.kagent:8080",
+                isolate_sessions=True,
+            )
+        ],
+    )
+
+    agent = config.to_agent("test_agent")
+
+    remote_agent_toolset = next(tool for tool in agent.tools if isinstance(tool, KAgentRemoteA2AToolset))
+    assert remote_agent_toolset._tool._isolate_sessions is True
 
 
 def test_remote_agent_no_proxy_when_not_configured():

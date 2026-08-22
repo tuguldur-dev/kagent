@@ -1,9 +1,10 @@
 import {
-  formRowsToGitRepos,
   gitRepoToFormRow,
   newEmptyGitSkillRow,
-  validateDeclarativeAgentSkills,
+  newEmptyS3SkillRow,
+  s3RefToFormRow,
   type GitSkillFormRow,
+  type S3SkillFormRow,
 } from "@/lib/agentSkillsForm";
 import {
   formUsesByoSections,
@@ -30,16 +31,14 @@ import { isResourceNameValid } from "@/lib/utils";
 import type {
   AgentType,
   AgentResponse,
-  Agent,
   AgentSpec,
   ContextConfig,
-  DeclarativeRuntime,
   EnvVar,
   GitRepo,
   ModelConfig,
   PromptSource,
+  S3SkillRef,
   SandboxAgent,
-  SkillForAgent,
   DeclarativeAgentSpec,
   Tool,
 } from "@/types";
@@ -56,7 +55,6 @@ export interface AgentFormValidationErrors {
   skills?: string;
   memoryModel?: string;
   memoryTtl?: string;
-  serviceAccountName?: string;
   promptSources?: string;
   byoCmd?: string;
   agentHarness?: AgentHarnessFormValidationError;
@@ -67,8 +65,6 @@ export interface AgentFormData {
   namespace: string;
   description: string;
   type?: AgentType;
-  runInSandbox?: boolean;
-  declarativeRuntime?: DeclarativeRuntime;
   systemPrompt?: string;
   modelName?: string;
   tools: Tool[];
@@ -76,6 +72,7 @@ export interface AgentFormData {
   skillRefs?: string[];
   skillGitRepos?: GitRepo[];
   skillsGitAuthSecretName?: string;
+  skillS3Repos?: S3SkillRef[];
   memory?: {
     modelConfig?: string;
     ttlDays?: number;
@@ -87,15 +84,7 @@ export interface AgentFormData {
   byoImage?: string;
   byoCmd?: string;
   byoArgs?: string[];
-  replicas?: number;
-  imagePullSecrets?: Array<{ name: string }>;
-  volumes?: unknown[];
-  volumeMounts?: unknown[];
-  labels?: Record<string, string>;
-  annotations?: Record<string, string>;
   env?: EnvVar[];
-  imagePullPolicy?: string;
-  serviceAccountName?: string;
   substrateWorkerPoolRefName?: string;
   substrateSnapshotsLocation?: string;
 }
@@ -121,7 +110,6 @@ export interface AgentFormFields {
   namespace: string;
   description: string;
   agentType: AgentFormWorkloadKind;
-  runInSandbox: boolean;
   systemPrompt: string;
   selectedModel: ModelConfig | null;
   selectedMemoryModel: ModelConfig | null;
@@ -130,18 +118,14 @@ export interface AgentFormFields {
   skillRefs: string[];
   skillGitRepos: GitSkillFormRow[];
   skillsGitAuthSecretName: string;
+  skillS3Repos: S3SkillFormRow[];
   byoImage: string;
   byoCmd: string;
   byoArgs: string;
-  replicas: string;
-  imagePullPolicy: string;
-  imagePullSecrets: string[];
   envPairs: AgentFormEnvRow[];
   stream: boolean;
   shareTools: boolean;
-  declarativeRuntime: DeclarativeRuntime;
   contextConfig: ContextConfig | undefined;
-  serviceAccountName: string;
   promptSourceRows: PromptSourceRow[];
   substrateWorkerPoolRefName: string;
   substrateSnapshotsLocation: string;
@@ -169,7 +153,6 @@ export function createInitialAgentFormState({
     namespace,
     description: "",
     agentType: "Declarative",
-    runInSandbox: false,
     systemPrompt: isEditMode ? "" : defaultSystemPrompt,
     selectedModel: null,
     selectedMemoryModel: null,
@@ -178,18 +161,14 @@ export function createInitialAgentFormState({
     skillRefs: [""],
     skillGitRepos: [newEmptyGitSkillRow()],
     skillsGitAuthSecretName: "",
+    skillS3Repos: [newEmptyS3SkillRow()],
     byoImage: "",
     byoCmd: "",
     byoArgs: "",
-    replicas: "",
-    imagePullPolicy: "",
-    imagePullSecrets: [""],
     envPairs: [{ name: "", value: "", isSecret: false }],
     stream: false,
     shareTools: false,
-    declarativeRuntime: "go",
     contextConfig: undefined,
-    serviceAccountName: "",
     promptSourceRows: [newPromptSourceRow()],
     isSubmitting: false,
     isLoading: isEditMode,
@@ -263,13 +242,6 @@ export function validateAgentFormData(
     errors.model = "Container image is required";
   }
 
-  if (data.serviceAccountName !== undefined) {
-    const serviceAccountName = data.serviceAccountName.trim();
-    if (serviceAccountName && !isResourceNameValid(serviceAccountName)) {
-      errors.serviceAccountName = `Service account name can only contain lowercase alphanumeric characters, "-" or ".", and must start and end with an alphanumeric character`;
-    }
-  }
-
   if (formUsesDeclarativeSections(type)) {
     const sources = (data.promptSources || []).filter((source) =>
       source.name.trim(),
@@ -299,10 +271,7 @@ export function agentResponseToFormState(
     namespace: agent.metadata.namespace || "",
     description: agent.spec.description || "",
     agentType: formWorkloadKindFromApi(agent.spec.type),
-    runInSandbox: agentResponse.workloadMode === "sandbox",
-    ...(agentResponse.workloadMode === "sandbox"
-      ? sandboxFieldsFromApiSpec(agent.spec.substrate)
-      : {}),
+    ...sandboxFieldsFromApiSpec(agent.spec.substrate),
   };
 
   if (agent.spec.type === "Declarative") {
@@ -342,9 +311,11 @@ export function agentResponseToFormState(
         ? agent.spec.skills.gitRefs.map(gitRepoToFormRow)
         : [newEmptyGitSkillRow()],
       skillsGitAuthSecretName: agent.spec.skills?.gitAuthSecretRef?.name || "",
+      skillS3Repos: agent.spec.skills?.s3Refs?.length
+        ? agent.spec.skills.s3Refs.map(s3RefToFormRow)
+        : [newEmptyS3SkillRow()],
       stream: declarative?.stream ?? false,
       shareTools: declarative?.shareTools ?? false,
-      declarativeRuntime: declarative?.runtime === "go" ? "go" : "python",
       selectedMemoryModel: memoryModelRef
         ? {
             ref: memoryModelRef,
@@ -353,18 +324,15 @@ export function agentResponseToFormState(
         : null,
       memoryTtlDays: memory?.ttlDays ? String(memory.ttlDays) : "",
       contextConfig: declarative?.context,
-      serviceAccountName: declarative?.deployment?.serviceAccountName || "",
       byoImage: "",
       byoCmd: "",
       byoArgs: "",
     };
   }
 
-  const deployment = agent.spec.byo?.deployment;
-  const imagePullSecrets =
-    deployment?.imagePullSecrets?.map((secret) => secret.name) ?? [];
+  const byo = agent.spec.byo;
   const envPairs =
-    deployment?.env?.map<AgentFormEnvRow>((env) =>
+    byo?.env?.map<AgentFormEnvRow>((env) =>
       env.valueFrom?.secretKeyRef
         ? {
             name: env.name || "",
@@ -383,18 +351,13 @@ export function agentResponseToFormState(
     selectedTools: [],
     selectedMemoryModel: null,
     memoryTtlDays: "",
-    byoImage: deployment?.image || "",
-    byoCmd: deployment?.cmd || "",
-    byoArgs: (deployment?.args || []).join(" "),
-    replicas:
-      deployment?.replicas !== undefined ? String(deployment.replicas) : "",
-    imagePullPolicy: deployment?.imagePullPolicy || "",
-    imagePullSecrets: imagePullSecrets.length > 0 ? imagePullSecrets : [""],
+    byoImage: byo?.image || "",
+    byoCmd: byo?.cmd || "",
+    byoArgs: (byo?.args || []).join(" "),
     envPairs:
       envPairs.length > 0
         ? envPairs
         : [{ name: "", value: "", isSecret: false }],
-    serviceAccountName: deployment?.serviceAccountName || "",
   };
 }
 
@@ -431,7 +394,6 @@ export function agentFormStateToData(
   state: AgentFormFields,
 ): AgentWorkloadFormData {
   const declarative = formUsesDeclarativeSections(state.agentType);
-  const skillsEnabled = declarative && !state.runInSandbox;
   const memoryEnabled = !!(
     state.selectedMemoryModel?.ref || state.memoryTtlDays
   );
@@ -441,7 +403,6 @@ export function agentFormStateToData(
     namespace: state.namespace,
     description: state.description,
     type: state.agentType,
-    runInSandbox: state.runInSandbox,
     systemPrompt: state.systemPrompt,
     promptSources: state.promptSourceRows.map(({ name, alias }) => ({
       name,
@@ -451,16 +412,6 @@ export function agentFormStateToData(
     stream: state.stream,
     shareTools: declarative ? state.shareTools : undefined,
     tools: state.selectedTools,
-    skillRefs: skillsEnabled
-      ? state.skillRefs.filter((ref) => ref.trim())
-      : undefined,
-    skillGitRepos: skillsEnabled
-      ? formRowsToGitRepos(state.skillGitRepos)
-      : undefined,
-    skillsGitAuthSecretName:
-      skillsEnabled && state.skillsGitAuthSecretName.trim()
-        ? state.skillsGitAuthSecretName.trim()
-        : undefined,
     memory:
       declarative && memoryEnabled
         ? {
@@ -471,25 +422,14 @@ export function agentFormStateToData(
           }
         : undefined,
     context: declarative ? state.contextConfig : undefined,
-    declarativeRuntime: declarative ? state.declarativeRuntime : undefined,
     byoImage: state.byoImage,
     byoCmd: state.byoCmd || undefined,
     byoArgs: state.byoArgs
       ? state.byoArgs.split(/\s+/).filter(Boolean)
       : undefined,
-    replicas: state.replicas ? Number.parseInt(state.replicas, 10) : undefined,
-    imagePullPolicy: state.imagePullPolicy || undefined,
-    imagePullSecrets: state.imagePullSecrets
-      .filter((name) => name.trim())
-      .map((name) => ({ name: name.trim() })),
     env: formEnvRowsToEnvVars(state.envPairs),
-    serviceAccountName: state.serviceAccountName.trim() || undefined,
-    ...(state.runInSandbox
-      ? {
-          substrateWorkerPoolRefName: state.substrateWorkerPoolRefName,
-          substrateSnapshotsLocation: state.substrateSnapshotsLocation,
-        }
-      : {}),
+    substrateWorkerPoolRefName: state.substrateWorkerPoolRefName,
+    substrateSnapshotsLocation: state.substrateSnapshotsLocation,
   };
 }
 
@@ -499,20 +439,9 @@ export function validateAgentFormState(
   const data = agentFormStateToData(state);
   const errors = validateAgentFormData(data);
 
-  if (state.agentType === "BYO" && state.runInSandbox && !state.byoCmd.trim()) {
+  if (state.agentType === "BYO" && !state.byoCmd.trim()) {
     errors.byoCmd = "Command is required for BYO agents on Agent Substrate";
   }
-  if (formUsesDeclarativeSections(state.agentType) && !state.runInSandbox) {
-    const skillsError = validateDeclarativeAgentSkills({
-      skillRefs: state.skillRefs,
-      skillGitRepos: state.skillGitRepos,
-      skillsGitAuthSecretName: state.skillsGitAuthSecretName,
-    });
-    if (skillsError) {
-      errors.skills = skillsError;
-    }
-  }
-
   return errors;
 }
 
@@ -528,12 +457,6 @@ function qualifiedResourceRef(namespace: string | undefined, ref: string): strin
     return ref;
   }
   return k8sRefUtils.toRef(namespace || "default", ref);
-}
-
-function declarativeRuntimeFromForm(
-  data: AgentWorkloadFormData,
-): DeclarativeRuntime {
-  return data.declarativeRuntime === "python" ? "python" : "go";
 }
 
 function resolveNamespacedRef(
@@ -592,44 +515,15 @@ function toolsFromForm(tools: Tool[], namespace: string): Tool[] {
         agent: {
           name: agentRef.name,
           namespace: agentRef.namespace,
-          kind: tool.agent.kind || "Agent",
+          kind: tool.agent.kind || "SandboxAgent",
           apiGroup: tool.agent.apiGroup || "kagent.dev",
         },
+        ...(tool.isolateSessions ? { isolateSessions: true } : {}),
       };
     }
 
     return tool;
   });
-}
-
-function skillsFromForm(
-  data: AgentWorkloadFormData,
-): SkillForAgent | undefined {
-  const refs = (data.skillRefs || []).map((ref) => ref.trim()).filter(Boolean);
-  const gitRefs = formRowsToGitRepos(
-    (data.skillGitRepos || []).map((repo) => ({
-      url: repo.url ?? "",
-      ref: repo.ref ?? "",
-      path: repo.path ?? "",
-      name: repo.name ?? "",
-    })),
-  );
-  if (refs.length === 0 && gitRefs.length === 0) {
-    return undefined;
-  }
-
-  const skills: SkillForAgent = {};
-  if (refs.length > 0) {
-    skills.refs = refs;
-  }
-  if (gitRefs.length > 0) {
-    skills.gitRefs = gitRefs;
-    const secretName = data.skillsGitAuthSecretName?.trim();
-    if (secretName) {
-      skills.gitAuthSecretRef = { name: secretName };
-    }
-  }
-  return skills;
 }
 
 function attachPromptTemplate(
@@ -662,7 +556,6 @@ function declarativeSpecFromForm(
   data: AgentWorkloadFormData,
 ): DeclarativeAgentSpec {
   const declarative: DeclarativeAgentSpec = {
-    runtime: declarativeRuntimeFromForm(data),
     systemMessage: data.systemPrompt || "",
     modelConfig: resourceNameFromRef(data.modelName),
     stream: data.stream ?? true,
@@ -681,37 +574,20 @@ function declarativeSpecFromForm(
   if (data.shareTools) {
     declarative.shareTools = true;
   }
-  const serviceAccountName = data.serviceAccountName?.trim();
-  if (serviceAccountName) {
-    declarative.deployment = { serviceAccountName };
-  }
   attachPromptTemplate(declarative, data);
   return declarative;
 }
 
 function byoSpecFromForm(data: AgentWorkloadFormData) {
   return {
-    deployment: {
-      image: data.byoImage || "",
-      cmd: data.byoCmd,
-      args: data.byoArgs,
-      replicas: data.replicas,
-      imagePullSecrets: data.imagePullSecrets,
-      volumes: data.volumes,
-      volumeMounts: data.volumeMounts,
-      labels: data.labels,
-      annotations: data.annotations,
-      env: data.env,
-      imagePullPolicy: data.imagePullPolicy,
-      serviceAccountName: data.serviceAccountName,
-    },
+    image: data.byoImage || "",
+    cmd: data.byoCmd,
+    args: data.byoArgs,
+    env: data.env,
   };
 }
 
-function agentSpecFromForm(
-  data: AgentWorkloadFormData,
-  sandbox: boolean,
-): AgentSpec {
+function agentSpecFromForm(data: AgentWorkloadFormData): AgentSpec {
   const type = data.type || "Declarative";
   const spec: AgentSpec = {
     type,
@@ -721,41 +597,24 @@ function agentSpecFromForm(
   switch (type) {
     case "Declarative":
       spec.declarative = declarativeSpecFromForm(data);
-      if (!sandbox) {
-        spec.skills = skillsFromForm(data);
-      }
       break;
     case "BYO":
       spec.byo = byoSpecFromForm(data);
       break;
   }
 
-  if (sandbox) {
-    spec.substrate = buildSandboxSubstrateFromForm({
-      ...data,
-      runInSandbox: true,
-    });
-  }
+  spec.substrate = buildSandboxSubstrateFromForm(data);
 
   return spec;
-}
-
-export function agentFormDataToAgent(data: AgentWorkloadFormData): Agent {
-  const spec = agentSpecFromForm(data, false);
-
-  return {
-    metadata: { name: data.name, namespace: data.namespace || "" },
-    spec,
-  };
 }
 
 export function agentFormDataToSandboxAgent(
   data: AgentWorkloadFormData,
 ): SandboxAgent {
-  const spec = agentSpecFromForm(data, true);
+  const spec = agentSpecFromForm(data);
 
   return {
-    apiVersion: "kagent.dev/v1alpha2",
+    apiVersion: "kagent.dev/v1alpha3",
     kind: "SandboxAgent",
     metadata: { name: data.name, namespace: data.namespace || "" },
     spec,

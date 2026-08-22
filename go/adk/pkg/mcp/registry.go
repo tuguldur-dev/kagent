@@ -7,9 +7,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"time"
 
-	"github.com/a2aproject/a2a-go/a2asrv"
+	"github.com/a2aproject/a2a-go/v2/a2asrv"
 	"github.com/go-logr/logr"
 	"github.com/kagent-dev/kagent/go/adk/pkg/constants"
 	"github.com/kagent-dev/kagent/go/api/adk"
@@ -46,7 +47,7 @@ func allowedRequestHeaders(ctx context.Context, allowed []string) map[string]str
 	if !ok {
 		return nil
 	}
-	meta := callCtx.RequestMeta()
+	meta := callCtx.ServiceParams()
 	if meta == nil {
 		return nil
 	}
@@ -71,6 +72,10 @@ type mcpServerParams struct {
 	PropagateToken        bool                  // when true, Authorization is forwarded independently of AllowedHeaders
 	HeaderProvider        DynamicHeaderProvider // optional per-request headers derived from invocation context (e.g., STS exchanged access tokens)
 	ServerType            string                // "http" or "sse"
+	Command               string
+	Args                  []string
+	Env                   map[string]string
+	Dir                   string
 	Timeout               *float64
 	SseReadTimeout        *float64
 	TLSInsecureSkipVerify *bool
@@ -93,11 +98,24 @@ func CreateToolsets(
 	ctx context.Context,
 	httpTools []adk.HttpMcpServerConfig,
 	sseTools []adk.SseMcpServerConfig,
+	stdioTools []adk.StdioMcpServerConfig,
 	propagateToken bool,
 	headerProvider DynamicHeaderProvider,
 ) []tool.Toolset {
 	log := logr.FromContextOrDiscard(ctx)
 	var toolsets []tool.Toolset
+
+	log.Info("Processing stdio MCP tools", "stdioToolsCount", len(stdioTools))
+	for i, stdioTool := range stdioTools {
+		params := mcpServerParams{
+			URL: stdioTool.Command, ServerType: "stdio", Command: stdioTool.Command,
+			Args: stdioTool.Args, Env: stdioTool.Env, Dir: stdioTool.Dir,
+		}
+		ts, err := addToolset(ctx, log, params, nil, "stdio", i+1)
+		if err == nil {
+			toolsets = append(toolsets, ts)
+		}
+	}
 
 	log.Info("Processing HTTP MCP tools", "httpToolsCount", len(httpTools))
 	for i, httpTool := range httpTools {
@@ -176,6 +194,15 @@ func addToolset(ctx context.Context, log logr.Logger, params mcpServerParams, to
 // Uses the official MCP SDK (github.com/modelcontextprotocol/go-sdk/mcp).
 func createTransport(ctx context.Context, params mcpServerParams) (mcpsdk.Transport, error) {
 	log := logr.FromContextOrDiscard(ctx)
+	if params.ServerType == "stdio" {
+		command := exec.CommandContext(ctx, params.Command, params.Args...)
+		command.Dir = params.Dir
+		command.Env = os.Environ()
+		for key, value := range params.Env {
+			command.Env = append(command.Env, key+"="+value)
+		}
+		return &mcpsdk.CommandTransport{Command: command}, nil
+	}
 
 	operationTimeout := defaultTimeout
 	if params.Timeout != nil && *params.Timeout > 0 {
@@ -281,7 +308,7 @@ func (rt *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	// A2A request independently of allowedHeaders.
 	if rt.propagateToken {
 		if callCtx, ok := a2asrv.CallContextFrom(req.Context()); ok {
-			if meta := callCtx.RequestMeta(); meta != nil {
+			if meta := callCtx.ServiceParams(); meta != nil {
 				if vals, ok := meta.Get(constants.AuthorizationHeader); ok && len(vals) > 0 && vals[0] != "" {
 					req.Header.Set(constants.AuthorizationHeader, vals[0])
 				}
@@ -336,8 +363,7 @@ func initializeToolSet(ctx context.Context, params mcpServerParams, toolFilter m
 	}
 
 	cfg := mcptoolset.Config{
-		Transport:  mcpTransport,
-		ToolFilter: toolPredicate,
+		Transport: mcpTransport,
 	}
 
 	toolset, err := mcptoolset.New(cfg)
@@ -345,5 +371,9 @@ func initializeToolSet(ctx context.Context, params mcpServerParams, toolFilter m
 		return nil, fmt.Errorf("failed to create MCP toolset for %s: %w", params.URL, err)
 	}
 
-	return &mcpAppToolset{inner: toolset, appToolNames: appToolNames}, nil
+	visibleTools := tool.Toolset(toolset)
+	if toolPredicate != nil {
+		visibleTools = tool.FilterToolset(toolset, toolPredicate)
+	}
+	return &mcpAppToolset{inner: visibleTools, appToolNames: appToolNames}, nil
 }

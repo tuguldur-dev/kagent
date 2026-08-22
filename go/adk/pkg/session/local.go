@@ -2,7 +2,6 @@ package session
 
 import (
 	"fmt"
-	"net/http"
 	"strings"
 
 	"github.com/glebarez/sqlite"
@@ -17,18 +16,11 @@ type LocalSessionService struct {
 	adksession.Service
 }
 
-// NewService builds the session service a runtime should use: dbURL (AgentConfig.session_db_url,
-// set by the controller for durable-dir sandbox agents) selects the actor-local sqlite store;
-// otherwise kagentURL selects the controller HTTP session service; otherwise nil (caller decides;
-// typically in-memory sessions). BYO agents building their own executor should use this to
-// populate KAgentExecutorConfig.SessionService so they honor the same contract as the
-// declarative runtime.
-func NewService(dbURL, kagentURL string, httpClient *http.Client) (adksession.Service, error) {
+// NewService builds the actor-local session service selected by AgentConfig.session_db_url.
+// A missing URL leaves session selection to the caller, which typically uses in-memory state.
+func NewService(dbURL string) (adksession.Service, error) {
 	if dbURL != "" {
 		return NewLocalSessionService(dbURL)
-	}
-	if kagentURL != "" {
-		return NewKAgentSessionService(kagentURL, httpClient), nil
 	}
 	return nil, nil
 }
