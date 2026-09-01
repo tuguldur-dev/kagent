@@ -116,6 +116,12 @@ const SHARE_HEADER = "X-Share-Token";
  */
 const HISTORY_PAGE_LIMIT = 50;
 
+/*
+ * Temporary bridge to A2A's ordered task timeline and artifact generation ranges:
+ * https://github.com/a2aproject/A2A/pull/2129
+ */
+const TIMELINE_POSITION_METADATA_KEY = "kagent.dev/timeline-position";
+
 /** Ids for the messages the wire did not name. */
 let counter = 0;
 function nextId(prefix: string): string {
@@ -212,7 +218,19 @@ function dataKindOf(data: Record<string, unknown>): ChatDataPart["dataKind"] {
 }
 
 function toParts(parts: readonly A2APart[] | undefined): ChatPart[] {
-  return (parts ?? []).map(toPart).filter((part): part is ChatPart => part !== undefined);
+  const result: ChatPart[] = [];
+  for (const source of parts ?? []) {
+    const part = toPart(source);
+    if (part === undefined) continue;
+
+    const previous = result.at(-1);
+    if (part.kind === "text" && previous?.kind === "text") {
+      previous.text += part.text;
+      continue;
+    }
+    result.push(part);
+  }
+  return result;
 }
 
 /** The prose of a set of parts, for comparing a reply against the artifact repeating it. */
@@ -412,7 +430,7 @@ export class A2AGrpcChatClient implements ChatClient {
     // again as the final artifact — so an artifact repeating text already shown is
     // dropped. Recorded as the accumulated text rather than per chunk, because the
     // artifact repeats the whole answer.
-    const seen = new Set<string>();
+    let statusReply = "";
     // The stream may echo the user's own message; when it does it must be emitted
     // only once. (This controller does not: measured on 2026-08-24, a turn carries
     // no message frame for it at all, and the caller's optimistic copy is what the
@@ -436,9 +454,9 @@ export class A2AGrpcChatClient implements ChatClient {
      *
      * A local, not a field and not a module-level map: it belongs to this turn and
      * must not outlive it. The artifact that closes the turn repeats the whole
-     * answer, so it is the accumulation that has to be recorded in `seen`, not each
-     * chunk — recording only chunks let the artifact through and printed the answer
-     * a second time.
+     * answer, so it is the accumulation that has to be recorded in `statusReply`,
+     * not each chunk — recording only chunks let the artifact through and printed
+     * the answer a second time.
      */
     let streamedText = "";
 
@@ -495,7 +513,7 @@ export class A2AGrpcChatClient implements ChatClient {
                 runId = invocation;
                 streamedId = message.messageId || nextId("message");
                 streamedText = chunk;
-                if (streamedText !== "") seen.add(streamedText);
+                statusReply = streamedText;
                 yield {
                   type: "message",
                   message: {
@@ -508,7 +526,7 @@ export class A2AGrpcChatClient implements ChatClient {
                 };
               } else if (chunk !== "") {
                 streamedText += chunk;
-                seen.add(streamedText);
+                statusReply = streamedText;
                 yield { type: "delta", messageId: streamedId, text: chunk };
               }
 
@@ -532,7 +550,7 @@ export class A2AGrpcChatClient implements ChatClient {
 
             if (closesRun) {
               const body = textOf(parts);
-              if (body !== "") seen.add(body);
+              statusReply = body;
               yield {
                 type: "message",
                 message: { id, role: "agent", parts, createdAt, taskId: event.taskId },
@@ -553,8 +571,7 @@ export class A2AGrpcChatClient implements ChatClient {
             if (!delivered.has(id)) {
               delivered.add(id);
               if (role === "agent") {
-                const body = textOf(parts);
-                if (body !== "") seen.add(body);
+                statusReply = textOf(parts);
               }
               yield {
                 type: "message",
@@ -614,13 +631,9 @@ export class A2AGrpcChatClient implements ChatClient {
             if (event.append) {
               const whole = (artifacts.get(artifactId) ?? "") + body;
               artifacts.set(artifactId, whole);
-              // The accumulation, not the chunk: what a later frame repeats is the
-              // whole answer, and that is what has to be recognised as already shown.
-              if (whole !== "") seen.add(whole);
               yield { type: "delta", messageId: id, text: body };
             } else {
               artifacts.set(artifactId, body);
-              if (body !== "") seen.add(body);
               yield {
                 type: "message",
                 message: {
@@ -638,11 +651,17 @@ export class A2AGrpcChatClient implements ChatClient {
           // First sight of this artifact. Dropped when it merely repeats prose the
           // reader has already been shown as status text — the same reply arriving
           // twice, which is the behaviour this branch was originally written for.
-          if (body !== "" && seen.has(body)) continue;
+          if (body !== "" && statusReply === body) {
+            statusReply = "";
+            continue;
+          }
+          // Text equality is only a compatibility check between adjacent wire
+          // representations of one reply. It is not artifact identity and must
+          // not survive across a real artifact or tool boundary.
+          statusReply = "";
 
           const id = artifactId || nextId("artifact");
           artifacts.set(id, body);
-          if (body !== "") seen.add(body);
           yield {
             type: "message",
             message: {
@@ -662,8 +681,6 @@ export class A2AGrpcChatClient implements ChatClient {
           for (const message of messagesFromTask(task)) {
             if (delivered.has(message.id)) continue;
             delivered.add(message.id);
-            const body = textOf(message.parts);
-            if (body !== "") seen.add(body);
             yield { type: "message", message };
           }
           yield { type: "status", state: turnState(task.status?.state), taskId: task.id };
@@ -731,8 +748,11 @@ export class A2AGrpcChatClient implements ChatClient {
  */
 export function messagesFromTask(task: A2ATask): ChatMessage[] {
   const messages: ChatMessage[] = [];
+  const positioned: { message: ChatMessage; position?: string }[] = [];
   const taken = new Set<string>();
   const createdAt = statusTime(task.status);
+  const hasCompleteTimeline = [...task.history, ...(task.status?.message ? [task.status.message] : []), ...task.artifacts]
+    .every((entry) => timelinePosition(entry.metadata) !== undefined);
 
   const push = (message: A2AMessage) => {
     const parts = toParts(message.parts);
@@ -741,7 +761,7 @@ export function messagesFromTask(task: A2ATask): ChatMessage[] {
       message.messageId || JSON.stringify(message.parts.map((part) => part.content));
     if (taken.has(identity)) return;
     taken.add(identity);
-    messages.push({
+    const converted: ChatMessage = {
       /*
        * Derived from the task and the position in it, never from a counter.
        *
@@ -762,7 +782,9 @@ export function messagesFromTask(task: A2ATask): ChatMessage[] {
       parts,
       createdAt,
       taskId: task.id || undefined,
-    });
+    };
+    messages.push(converted);
+    positioned.push({ message: converted, position: timelinePosition(message.metadata) });
   };
 
   /*
@@ -797,8 +819,11 @@ export function messagesFromTask(task: A2ATask): ChatMessage[] {
   for (const artifact of task.artifacts) {
     const parts = toParts(artifact.parts);
     const body = textOf(parts);
-    if (parts.length === 0 || (body !== "" && shown.has(body))) continue;
-    agent.push({
+    if (
+      parts.length === 0 ||
+      (!hasCompleteTimeline && body !== "" && shown.has(body))
+    ) continue;
+    const converted: ChatMessage = {
       // Derived, for the reason given against the message id above: an unnamed
       // artifact renamed on every read is an artifact the merge cannot recognise.
       id: artifact.artifactId || `${task.id || "task"}-artifact-${messages.length + agent.length}`,
@@ -806,10 +831,25 @@ export function messagesFromTask(task: A2ATask): ChatMessage[] {
       parts,
       createdAt,
       taskId: task.id || undefined,
-    });
+    };
+    agent.push(converted);
+    positioned.push({ message: converted, position: timelinePosition(artifact.metadata) });
+  }
+
+  // New records carry one server-authored order across history and artifacts.
+  // Keep the positional inference below for records written before this bridge.
+  if (positioned.length > 0 && positioned.every(({ position }) => position !== undefined)) {
+    return positioned
+      .sort((left, right) => left.position!.localeCompare(right.position!))
+      .map(({ message }) => message);
   }
 
   return interleaveTaskMessages(opening, answers, agent);
+}
+
+function timelinePosition(metadata: JsonObject | undefined): string | undefined {
+  const value = metadata?.[TIMELINE_POSITION_METADATA_KEY];
+  return typeof value === "string" ? value : undefined;
 }
 
 /** Whether a reader's turn is answering an `ask_user` rather than opening a task. */

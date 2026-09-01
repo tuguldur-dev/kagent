@@ -1,5 +1,12 @@
 import { test, expect } from "../../fixtures/test";
 import { SIBLING_OF_READY, agentChat, instances, loadPage } from "../../helpers/app";
+import {
+  beginTurn,
+  expectTurnFinished,
+  sendAndAwaitTurn,
+  sendMessage,
+  type SentTurn,
+} from "../../helpers/chat";
 
 /**
  * Chat — the conversation journey.
@@ -63,6 +70,8 @@ test("chat: history, sending, streaming, and tool rendering", async ({ page }) =
   // Scoped by role: the agent quotes the question back in its reply, so a plain
   // text filter matches the answer as well as the question that prompted it.
   const userMessages = page.locator('[data-testid="chat-message"][data-role="user"]');
+  // Held across steps because a turn is sent in one and finishes in another.
+  let turn: SentTurn;
 
   await test.step("1. the page opens on the conversation, ready to be typed into", async () => {
     await loadPage(page, AGENT_CHAT);
@@ -123,8 +132,7 @@ test("chat: history, sending, streaming, and tool rendering", async ({ page }) =
   });
 
   await test.step("7. sending a message adds it to the transcript immediately", async () => {
-    await page.getByTestId("chat-input").fill(FIRST_QUESTION);
-    await page.getByTestId("chat-send").click();
+    turn = await sendMessage(page, FIRST_QUESTION);
 
     // The reader's own words, before the server has said anything. The fixture
     // does not echo them back and neither does the gateway, so this can only pass
@@ -159,8 +167,8 @@ test("chat: history, sending, streaming, and tool rendering", async ({ page }) =
   });
 
   await test.step("11. the turn finishes, the composer comes back, and the indicator settles", async () => {
+    await expectTurnFinished(page, turn);
     await expect(page.getByTestId("chat-send")).toBeVisible();
-    await expect(page.getByTestId("chat-cancel")).toHaveCount(0);
     // Nothing reported once the turn is over: the status line belongs to a turn in
     // flight, so a finished one leaves it with nothing to say.
     await expect(page.getByTestId("chat-status")).toHaveCount(0);
@@ -169,15 +177,14 @@ test("chat: history, sending, streaming, and tool rendering", async ({ page }) =
   await test.step("12. a second question behaves exactly like the first", async () => {
     // The report was that further questions behaved the same way — only the agent's
     // replies appeared. So the second turn is driven, not assumed from the first.
-    await page.getByTestId("chat-input").fill(SECOND_QUESTION);
-    await page.getByTestId("chat-send").click();
+    turn = await sendMessage(page, SECOND_QUESTION);
 
     await expect(
       userMessages.filter({ hasText: SECOND_QUESTION }),
       "the second question should be on screen as soon as it is sent, like the first",
     ).toHaveCount(1);
 
-    await expect(page.getByTestId("chat-cancel")).toHaveCount(0);
+    await expectTurnFinished(page, turn);
     await expect(
       messages.last().getByTestId("chat-message-text"),
       "the second reply should assemble exactly once",
@@ -198,6 +205,10 @@ test("chat: history, sending, streaming, and tool rendering", async ({ page }) =
     await page.reload();
     await expect(page.getByTestId("chat-input")).toBeVisible();
     await expect(messages).toHaveCount(before.length);
+    // The seeded reply carries a mermaid diagram, which renders asynchronously
+    // after the reload — the inner-text comparison below would otherwise catch
+    // it mid-render, showing the raw source where the SVG will be.
+    await expect(page.getByTestId("chat-mermaid").locator("svg")).toBeVisible();
     expect(
       await messages.allInnerTexts(),
       "the reloaded conversation should be the one that was on screen",
@@ -230,9 +241,7 @@ test("chat: history, sending, streaming, and tool rendering", async ({ page }) =
      * not something a glance at a still will catch.
      */
     await page.setViewportSize({ width: 1440, height: 420 });
-    await page.getByTestId("chat-input").fill("one more, to make the page scroll");
-    await page.getByTestId("chat-send").click();
-    await expect(page.getByTestId("chat-cancel")).toHaveCount(0);
+    await sendAndAwaitTurn(page, "one more, to make the page scroll");
 
     /*
      * The box that scrolls must end above the box you type in.
@@ -388,6 +397,8 @@ test("chat: an agent's Markdown renders as elements, not as characters", async (
   // the render, and the assertion below is about the render.
   await expect(page.getByTestId("chat-message")).toHaveCount(4);
 
+  // Taken before the message is sent, so the wait below is about this turn.
+  const turn = await beginTurn(page);
   await page.getByTestId("chat-input").fill("How many pods are running?");
   await expect(page.getByTestId("chat-send")).toBeEnabled();
   await page.getByTestId("chat-send").click();
@@ -396,7 +407,7 @@ test("chat: an agent's Markdown renders as elements, not as characters", async (
   // transcript before the reply exists, and without the second it can read a half-streamed
   // list whose item count is whatever had arrived.
   await expect(page.getByTestId("chat-cancel")).toBeVisible();
-  await expect(page.getByTestId("chat-cancel")).toHaveCount(0);
+  await expectTurnFinished(page, turn);
 
   const answer = page.getByTestId("chat-message").last().getByTestId("chat-message-text");
 
@@ -410,4 +421,28 @@ test("chat: an agent's Markdown renders as elements, not as characters", async (
   // And the source characters are gone: this is what fails when the renderer is
   // bypassed and the raw Markdown is printed instead.
   await expect(answer).not.toContainText("**");
+});
+
+/**
+ * A fenced ` ```mermaid ` block is a diagram, not a listing.
+ *
+ * The seeded conversation's reply carries one, so this opens the page and waits
+ * for the real renderer (mermaid runs in the browser, not in jsdom) to turn it
+ * into an SVG. The failure mode this guards is the one the page had: the block
+ * printed as raw text, which reads as an answer and passes any text assertion.
+ */
+test("chat: a mermaid block renders as a diagram, not as source text", async ({ page }) => {
+  await loadPage(page, AGENT_CHAT);
+  await expect(page.getByTestId("chat-message")).toHaveCount(4);
+
+  // The seeded reply's diagram, rendered to an SVG by mermaid.
+  const diagram = page.getByTestId("chat-mermaid");
+  await expect(diagram).toHaveCount(1);
+  await expect(diagram.locator("svg")).toBeVisible();
+
+  // The diagram is a diagram: the source text is gone, and the nodes it drew
+  // are in the SVG's own text rather than in a code frame.
+  await expect(diagram).not.toContainText("flowchart TD");
+  await expect(diagram).toContainText("Container starts");
+  await expect(diagram).toContainText("Kubelet restarts container");
 });

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	a2a "github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/google/uuid"
 	"github.com/kagent-dev/kagent/go/api/adk"
 	"github.com/kagent-dev/kagent/go/api/v1alpha3"
 	"github.com/pgvector/pgvector-go"
@@ -254,20 +255,18 @@ type AgentTemplateHarnessPair struct {
 }
 
 type RuntimeRevision struct {
-	Revision               string
-	Namespace              string
-	AgentTemplateName      string
-	AgentTemplateUID       string
-	HarnessName            string
-	HarnessUID             string
-	SourceSnapshot         json.RawMessage
-	AgentCard              json.RawMessage
-	EgressDestinations     []string
-	ActorTemplateNamespace string
-	ActorTemplateName      string
-	ActorTemplateUID       string
-	Phase                  string
-	GoldenSnapshot         string
+	Revision              string
+	Namespace             string
+	AgentTemplateName     string
+	AgentTemplateUID      string
+	HarnessName           string
+	HarnessUID            string
+	SourceSnapshot        json.RawMessage
+	AgentCard             json.RawMessage
+	EgressDestinations    []string
+	ActorTemplateAtespace string
+	ActorTemplateName     string
+	ActorTemplateUID      string
 }
 
 // AgentInstanceQuery narrows a page of AgentInstances. Zero values mean "do not
@@ -289,9 +288,9 @@ type AgentInstanceQuery struct {
 }
 
 type AgentInstanceShare struct {
-	ID         string
+	ID         uuid.UUID
 	Namespace  string
-	InstanceID string
+	InstanceID uuid.UUID
 	Permission string
 	TokenHash  []byte
 	CreatedAt  time.Time
@@ -314,10 +313,10 @@ type AgentInstanceTaskSnapshot struct {
 }
 
 type AgentInstanceCheckpoint struct {
-	ID                   string
+	ID                   uuid.UUID
 	Namespace            string
-	SourceInstanceID     string
-	SourceContextID      string
+	SourceInstanceID     uuid.UUID
+	SourceContextID      uuid.UUID
 	UserID               string
 	RequestID            string
 	HeadTaskID           string
