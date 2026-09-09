@@ -9,7 +9,7 @@ set -euo pipefail
 
 # The repo this script lives in, so it works from any checkout and any directory.
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SUBSTRATE_VERSION=0.0.22
+SUBSTRATE_VERSION=0.0.26
 cd "$REPO"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$1"; }
@@ -21,12 +21,12 @@ step "2/10  kubectl-ate, the tool that mints the CA and JWT pools"
 # This one runs on *this* machine rather than in the cluster, so it follows the host OS.
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 HOSTARCH="$(uname -m)"; [ "$HOSTARCH" = "x86_64" ] && HOSTARCH=amd64; [ "$HOSTARCH" = "aarch64" ] && HOSTARCH=arm64
-if [ ! -x /tmp/kubectl-ate ]; then
-  curl -fsSL -o /tmp/kubectl-ate \
+ATE="/tmp/kubectl-ate-v${SUBSTRATE_VERSION}"
+if [ ! -x "$ATE" ]; then
+  curl -fsSL -o "$ATE" \
     "https://github.com/kagent-dev/substrate/releases/download/v${SUBSTRATE_VERSION}/kubectl-ate-${OS}-${HOSTARCH}"
-  chmod +x /tmp/kubectl-ate
+  chmod +x "$ATE"
 fi
-ATE=/tmp/kubectl-ate
 
 step "3/10  Substrate CRDs and substrate"
 helm upgrade --install substrate-crds \
@@ -84,7 +84,7 @@ step "7/10  The controller and the UI, both built from this checkout"
 ARCH="$(uname -m)"; [ "$ARCH" = "x86_64" ] && ARCH=amd64; [ "$ARCH" = "aarch64" ] && ARCH=arm64
 docker buildx build --push --platform "linux/${ARCH}" \
   --build-arg BASE_IMAGE_REGISTRY=cgr.dev \
-  --build-arg BUILD_PACKAGE=core/cmd/controller-v2/main.go \
+  --build-arg BUILD_PACKAGE=core/cmd/controller/main.go \
   -t localhost:5001/kagent-dev/kagent/controller:dev -f go/Dockerfile ./go
 kubectl -n kagent set image deploy/kagent-controller controller=localhost:5001/kagent-dev/kagent/controller:dev
 

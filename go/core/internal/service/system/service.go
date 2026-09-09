@@ -9,16 +9,17 @@ import (
 
 	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/kagent-dev/kagent/go/core/internal/database"
 	"github.com/kagent-dev/kagent/go/core/internal/service/serviceerrors"
+	"github.com/kagent-dev/kagent/go/core/internal/substrate"
 	"github.com/kagent-dev/kagent/go/core/internal/version"
 	"github.com/kagent-dev/kagent/go/core/pkg/auth"
-	"github.com/kagent-dev/kagent/go/core/v2/substrate"
+	"github.com/kagent-dev/kagent/go/pkg/logging"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 type Version struct {
@@ -33,14 +34,17 @@ type ATEClient interface {
 	ListActorTemplates(context.Context, string) ([]*ateapipb.ActorTemplate, error)
 }
 
+type runtimeRevisionStore interface {
+	ListActorTemplateHarnesses(context.Context) ([]database.ActorTemplateHarness, error)
+}
+
 type Service struct {
 	kubeClient         client.Client
 	observedNamespaces []string
 	authorizer         auth.Authorizer
 	ateClient          ATEClient
+	revisions          runtimeRevisionStore
 }
-
-type Option func(*Service)
 
 type Namespace struct {
 	Name   string
@@ -101,25 +105,19 @@ type SubstrateWorker struct {
 	Version         int64
 }
 
-func NewService(options ...Option) *Service {
-	service := &Service{}
-	for _, option := range options {
-		option(service)
-	}
-	return service
-}
-
-func WithInventory(
+func NewService(
 	kubeClient client.Client,
 	observedNamespaces []string,
 	authorizer auth.Authorizer,
 	ateClient ATEClient,
-) Option {
-	return func(service *Service) {
-		service.kubeClient = kubeClient
-		service.observedNamespaces = slices.Clone(observedNamespaces)
-		service.authorizer = authorizer
-		service.ateClient = ateClient
+	revisions runtimeRevisionStore,
+) *Service {
+	return &Service{
+		kubeClient:         kubeClient,
+		observedNamespaces: slices.Clone(observedNamespaces),
+		authorizer:         authorizer,
+		ateClient:          ateClient,
+		revisions:          revisions,
 	}
 }
 
@@ -172,7 +170,7 @@ func (s *Service) ListNamespaces(ctx context.Context) ([]Namespace, error) {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			ctrllog.FromContext(ctx).Error(err, "Failed to get namespace", "namespace", observedNamespace)
+			logging.FromContext(ctx).ErrorContext(ctx, "failed to get namespace", "error", err, "namespace", observedNamespace)
 			continue
 		}
 		namespaces = append(namespaces, Namespace{Name: namespace.Name, Status: string(namespace.Status.Phase)})
@@ -182,7 +180,7 @@ func (s *Service) ListNamespaces(ctx context.Context) ([]Namespace, error) {
 }
 
 func (s *Service) GetSubstrateStatus(ctx context.Context, requestedNamespace string) (SubstrateStatus, error) {
-	if err := s.authorize(ctx, auth.VerbGet, auth.Resource{Type: "Agent"}); err != nil {
+	if err := s.authorize(ctx, auth.VerbGet, auth.Resource{Type: "Substrate"}); err != nil {
 		return SubstrateStatus{}, err
 	}
 
@@ -209,6 +207,9 @@ func (s *Service) GetSubstrateStatus(ctx context.Context, requestedNamespace str
 	if s.kubeClient == nil {
 		return SubstrateStatus{}, serviceerrors.NewInternal("Failed to list substrate resources from Kubernetes", fmt.Errorf("kubernetes client is not configured"))
 	}
+	if s.revisions == nil {
+		return SubstrateStatus{}, serviceerrors.NewInternal("Failed to list ActorTemplate harnesses", fmt.Errorf("runtime revision store is not configured"))
+	}
 
 	namespaces := s.substrateNamespaces(requestedNamespace)
 	for _, namespace := range namespaces {
@@ -225,7 +226,7 @@ func (s *Service) GetSubstrateStatus(ctx context.Context, requestedNamespace str
 	result.Workers = workers
 	if err != nil {
 		result.ATEAPIError = err.Error()
-		ctrllog.FromContext(ctx).Error(err, "list ate-api state")
+		logging.FromContext(ctx).ErrorContext(ctx, "failed to list ate-api state", "error", err)
 	}
 
 	slices.SortStableFunc(result.WorkerPools, func(left, right SubstrateWorkerPool) int {
@@ -337,6 +338,15 @@ func (s *Service) listATEState(ctx context.Context, namespaces []string) ([]Subs
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	harnessesFromDB, err := s.revisions.ListActorTemplateHarnesses(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	type templateKey struct{ atespace, name, uid string }
+	harnesses := make(map[templateKey]string, len(harnessesFromDB))
+	for _, template := range harnessesFromDB {
+		harnesses[templateKey{template.Atespace, template.Name, template.UID}] = template.HarnessName
+	}
 	templates := make([]SubstrateActorTemplate, 0, len(templatesFromAPI))
 	for _, template := range templatesFromAPI {
 		if template == nil || !allowedAtespace(template.GetMetadata().GetAtespace(), allowAll, allowed) {
@@ -349,13 +359,17 @@ func (s *Service) listATEState(ctx context.Context, namespaces []string) ([]Subs
 		} else if golden.GetGoldenSnapshot() != nil {
 			phase = "Ready"
 		}
+		metadata := template.GetMetadata()
 		templates = append(templates, SubstrateActorTemplate{
-			Namespace:      template.GetMetadata().GetAtespace(),
-			Name:           template.GetMetadata().GetName(),
-			Phase:          phase,
-			GoldenSnapshot: objectRefString(golden.GetGoldenSnapshot()),
-			SandboxClass:   template.GetSandboxConfig().GetSandboxClass().String(),
-			WorkerSelector: labelSelectorString(ctx, &metav1.LabelSelector{MatchLabels: template.GetWorkerSelector().GetMatchLabels()}),
+			Namespace:       metadata.GetAtespace(),
+			Name:            metadata.GetName(),
+			Phase:           phase,
+			GoldenActorID:   metadata.GetUid(),
+			GoldenSnapshot:  golden.GetGoldenSnapshot().GetSnapshotUri(),
+			SandboxClass:    strings.ToLower(strings.TrimPrefix(template.GetSandboxConfig().GetSandboxClass().String(), "SANDBOX_CLASS_")),
+			WorkerSelector:  labelSelectorString(ctx, &metav1.LabelSelector{MatchLabels: template.GetWorkerSelector().GetMatchLabels()}),
+			HarnessName:     harnesses[templateKey{metadata.GetAtespace(), metadata.GetName(), metadata.GetUid()}],
+			ManagedByKagent: true,
 		})
 	}
 
@@ -394,13 +408,6 @@ func allowedAtespace(atespace string, allowAll bool, allowed map[string]struct{}
 	return ok
 }
 
-func objectRefString(ref *ateapipb.ObjectRef) string {
-	if ref == nil {
-		return ""
-	}
-	return ref.GetAtespace() + "/" + ref.GetName()
-}
-
 func actorFromProto(actor *ateapipb.Actor) SubstrateActor {
 	assignment := actor.GetStatus().GetWorkerAssignment()
 	return SubstrateActor{
@@ -412,7 +419,7 @@ func actorFromProto(actor *ateapipb.Actor) SubstrateActor {
 		AteomPodNamespace:      assignment.GetWorkerNamespace(),
 		AteomPodName:           assignment.GetWorkerPod(),
 		AteomPodIP:             assignment.GetWorkerPodIp(),
-		LatestSnapshot:         actor.GetStatus().GetLatestSnapshot().GetName(),
+		LatestSnapshot:         actor.GetStatus().GetExternalSnapshot().GetSnapshotUri(),
 		WorkerPoolName:         assignment.GetWorkerPool(),
 		InProgressSnapshot:     actor.GetStatus().GetInProgressSnapshotName(),
 		Version:                actor.GetMetadata().GetVersion(),
@@ -420,14 +427,10 @@ func actorFromProto(actor *ateapipb.Actor) SubstrateActor {
 }
 
 func workerFromProto(worker *ateapipb.Worker) SubstrateWorker {
-	assignment := worker.GetStatus().GetAssignment()
 	return SubstrateWorker{
 		WorkerNamespace: worker.GetWorkerNamespace(),
 		WorkerPool:      worker.GetWorkerPool(),
 		WorkerPod:       worker.GetWorkerPod(),
-		ActorNamespace:  assignment.GetActorTemplateRef().GetAtespace(),
-		ActorTemplate:   assignment.GetActorTemplateRef().GetName(),
-		ActorID:         assignment.GetActor().GetName(),
 		IP:              worker.GetIp(),
 		Version:         worker.GetMetadata().GetVersion(),
 	}
@@ -439,7 +442,7 @@ func labelSelectorString(ctx context.Context, selector *metav1.LabelSelector) st
 	}
 	result, err := metav1.LabelSelectorAsSelector(selector)
 	if err != nil {
-		ctrllog.FromContext(ctx).Info("invalid ActorTemplate workerSelector", "error", err)
+		logging.FromContext(ctx).WarnContext(ctx, "invalid agent template worker selector", "error", err)
 		return "<invalid selector>"
 	}
 	return result.String()

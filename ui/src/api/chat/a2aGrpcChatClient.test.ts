@@ -28,8 +28,8 @@ import { A2AGrpcChatClient } from "./a2aGrpcChatClient";
 import type { ChatEvent, ChatMessage } from "./types";
 
 const CONVERSATION = {
-  namespace: "kagent",
   id: "6f1c9d20-1b7a-4a1e-9a3f-2c0d8e5b1a44",
+  contextId: "8f1c9d20-1b7a-4a1e-9a3f-2c0d8e5b1a44",
 };
 
 afterEach(() => setApiTransport(undefined));
@@ -71,7 +71,7 @@ function statusFrame(options: {
       case: "statusUpdate" as const,
       value: {
         taskId: options.taskId ?? "task-1",
-        contextId: CONVERSATION.id,
+        contextId: CONVERSATION.contextId,
         status: {
           state: options.state ?? TaskState.WORKING,
           message: options.message,
@@ -343,7 +343,7 @@ describe("A2AGrpcChatClient.send", () => {
           case: "artifactUpdate" as const,
           value: {
             taskId: "task-1",
-            contextId: CONVERSATION.id,
+            contextId: CONVERSATION.contextId,
             artifact: {
               artifactId: "a-1",
               parts: [text("3 pods are running.")],
@@ -367,7 +367,7 @@ describe("A2AGrpcChatClient.send", () => {
           case: "artifactUpdate" as const,
           value: {
             taskId: "task-1",
-            contextId: CONVERSATION.id,
+            contextId: CONVERSATION.contextId,
             artifact: { artifactId: "a-1", parts: [text("Only in the artifact.")] },
             lastChunk: true,
           },
@@ -397,7 +397,7 @@ describe("A2AGrpcChatClient.send", () => {
         case: "artifactUpdate" as const,
         value: {
           taskId: "task-1",
-          contextId: CONVERSATION.id,
+          contextId: CONVERSATION.contextId,
           artifact: { artifactId: "a-1", parts: [text(value)] },
           ...flags,
         },
@@ -435,7 +435,7 @@ describe("A2AGrpcChatClient.send", () => {
         case: "artifactUpdate" as const,
         value: {
           taskId: "task-1",
-          contextId: CONVERSATION.id,
+          contextId: CONVERSATION.contextId,
           artifact: { artifactId: "a-1", parts: [text(value)] },
           ...flags,
         },
@@ -593,11 +593,11 @@ describe("A2AGrpcChatClient.send", () => {
 
     // Both halves of the address, because the gateway routes on the metadata rather
     // than on a path — a gRPC method has no path to put them in.
-    expect(namespaceHeader).toBe(CONVERSATION.namespace);
+    expect(namespaceHeader).toBeNull();
     expect(idHeader).toBe(CONVERSATION.id);
     // The instance's own id is the conversation's context, and the gateway refuses a
     // value that is neither empty nor its own.
-    expect(sent?.message?.contextId).toBe(CONVERSATION.id);
+    expect(sent?.message?.contextId).toBe(CONVERSATION.contextId);
     expect(sent?.message?.role).toBe(Role.USER);
   });
 });
@@ -616,7 +616,7 @@ describe("A2AGrpcChatClient.history", () => {
     serveTasks([
       {
         id: "task-1",
-        contextId: CONVERSATION.id,
+        contextId: CONVERSATION.contextId,
         status: { state: TaskState.COMPLETED, timestamp: { seconds: 1767225600n } },
         history: [
           { messageId: "u0", role: Role.USER, parts: [text("start")], metadata: position("1") },
@@ -639,7 +639,7 @@ describe("A2AGrpcChatClient.history", () => {
     serveTasks([
       {
         id: "task-1",
-        contextId: CONVERSATION.id,
+        contextId: CONVERSATION.contextId,
         status: { state: TaskState.COMPLETED, timestamp: { seconds: 1767225600n } },
         history: [
           { messageId: "user", role: Role.USER, parts: [text("inspect")], metadata: position("1") },
@@ -676,7 +676,7 @@ describe("A2AGrpcChatClient.history", () => {
     serveTasks([
       {
         id: "task-1",
-        contextId: CONVERSATION.id,
+        contextId: CONVERSATION.contextId,
         status: { state: TaskState.COMPLETED, timestamp: { seconds: 1767225600n } },
         history: [
           { messageId: "user", role: Role.USER, parts: [text("repeat")], metadata: position("1") },
@@ -699,7 +699,7 @@ describe("A2AGrpcChatClient.history", () => {
     serveTasks([
       {
         id: "task-1",
-        contextId: CONVERSATION.id,
+        contextId: CONVERSATION.contextId,
         status: { state: TaskState.COMPLETED, timestamp: { seconds: 1767225600n } },
         history: [
           {
@@ -725,7 +725,7 @@ describe("A2AGrpcChatClient.history", () => {
     serveTasks([
       {
         id: "task-1",
-        contextId: CONVERSATION.id,
+        contextId: CONVERSATION.contextId,
         status: { state: TaskState.COMPLETED, timestamp: { seconds: 1767225600n } },
         history: [{ messageId: "m1", role: Role.USER, parts: [text("hello")] }],
         artifacts: [],
@@ -741,7 +741,7 @@ describe("A2AGrpcChatClient.history", () => {
     serveTasks([
       {
         id: "task-1",
-        contextId: CONVERSATION.id,
+        contextId: CONVERSATION.contextId,
         status: {
           state: TaskState.COMPLETED,
           timestamp: { seconds: 1767225600n },
@@ -774,7 +774,7 @@ describe("A2AGrpcChatClient.history", () => {
      */
     const task = {
       id: "task-1",
-      contextId: CONVERSATION.id,
+      contextId: CONVERSATION.contextId,
       status: { state: TaskState.COMPLETED, timestamp: { seconds: 1767225600n } },
       history: [
         { messageId: "m1", role: Role.USER, parts: [text("how many pods?")] },
@@ -803,7 +803,7 @@ describe("A2AGrpcChatClient.history", () => {
     serveTasks([
       {
         id: "task-1",
-        contextId: CONVERSATION.id,
+        contextId: CONVERSATION.contextId,
         status: { state: TaskState.COMPLETED, timestamp: { seconds: 1767225600n } },
         history: [{ messageId: "m1", role: Role.AGENT, parts: [text("3 pods")] }],
         artifacts: [{ artifactId: "a-1", parts: [text("3 pods")] }],
@@ -821,7 +821,7 @@ describe("A2AGrpcChatClient.history", () => {
     serveTasks([
       {
         id: "task-1",
-        contextId: CONVERSATION.id,
+        contextId: CONVERSATION.contextId,
         status: { state: TaskState.COMPLETED, timestamp: { seconds: 1767225600n } },
         history: [],
         artifacts: [
@@ -855,7 +855,7 @@ describe("A2AGrpcChatClient.history", () => {
       tasks: [
         {
           id,
-          contextId: CONVERSATION.id,
+          contextId: CONVERSATION.contextId,
           status: { state: TaskState.COMPLETED, timestamp: { seconds: 1767225600n } },
           history: [{ messageId: `m-${id}`, role: Role.USER, parts: [text(id)] }],
           artifacts: [],

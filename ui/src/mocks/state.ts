@@ -11,12 +11,6 @@
  * spec's creates cannot leak into the next one's list.
  */
 
-import type {
-  Agent,
-  AgentCreateRequest,
-  AgentKindName,
-  AgentResponse,
-} from "@/api/domain/agents";
 import type { ModelConfig, ModelConfigSpec } from "@/api/domain/models";
 import type { ToolServerResponse } from "@/api/domain/mcpServers";
 import type {
@@ -35,7 +29,6 @@ import {
   mockAgentInstances,
   mockAgentTemplates,
   mockHarnesses,
-  mockAgents,
   mockMcpServers,
   mockModels,
   mockPromptDetails,
@@ -44,7 +37,6 @@ import {
 
 /** What has been written during this browsing session. */
 const created = {
-  agents: [] as AgentResponse[],
   models: [] as ModelConfig[],
   mcpServers: [] as ToolServerResponse[],
   prompts: [] as PromptTemplateDetail[],
@@ -68,116 +60,6 @@ function dedupeByRef<T>(rows: readonly T[], refOf: (row: T) => string): T[] {
   const byRef = new Map<string, T>();
   for (const row of rows) byRef.set(refOf(row), row);
   return [...byRef.values()];
-}
-
-// ---------------------------------------------------------------------------
-// Agents
-// ---------------------------------------------------------------------------
-
-export const agentRef = (row: AgentResponse) =>
-  `${row.agent.metadata.namespace ?? ""}/${row.agent.metadata.name}`;
-
-/**
- * Every agent, deduped, so an edit to a *fixture* agent shadows it rather than
- * sitting beside it.
- *
- * Without the dedupe the list showed the same agent twice after a save and a read
- * answered with the original, because `find` returns the first match and the
- * fixtures come first — so the edit form reopened showing the values the user had
- * just replaced, and the feature looked broken when only the fixture was.
- */
-export function allAgents(): AgentResponse[] {
-  return dedupeByRef([...mockAgents, ...created.agents], agentRef).filter((row) =>
-    isLive(agentRef(row)),
-  );
-}
-
-/**
- * Records a create or an edit and answers with the row a list would now show.
- *
- * An edit to a seeded agent is recorded as an addition rather than by mutating the
- * fixture, which is what lets the list show the new values while the fixtures stay
- * constants.
- */
-export function saveAgent(row: AgentResponse): AgentResponse {
-  const ref = agentRef(row);
-  const at = created.agents.findIndex((existing) => agentRef(existing) === ref);
-  if (at === -1) created.agents.push(row);
-  else created.agents[at] = row;
-  // A resource written again after being deleted exists again, which is what the
-  // cluster would say too.
-  deleted.delete(ref);
-  return row;
-}
-
-/**
- * The row the controller would have reported for a freshly written agent.
- *
- * `model` and `modelProvider` are resolved from the referenced ModelConfig here
- * for the same reason the controller resolves them: they are not in the resource,
- * and a new row that left them blank would read differently from every other row
- * in the same list.
- */
-export function buildAgentResponse(
-  draft: AgentCreateRequest,
-  kind: AgentKindName,
-): AgentResponse {
-  const now = new Date().toISOString();
-
-  const agent: Agent = {
-    apiVersion: draft.apiVersion ?? "kagent.dev/v1alpha3",
-    kind: draft.kind ?? kind,
-    metadata: {
-      ...draft.metadata,
-      creationTimestamp: now,
-      resourceVersion: `${30_000 + created.agents.length}`,
-    },
-    spec: draft.spec,
-    status: {
-      observedGeneration: 1,
-      conditions: [
-        {
-          type: "Ready",
-          status: "True",
-          reason: "DeploymentReady",
-          lastTransitionTime: now,
-        },
-      ],
-    },
-  };
-
-  return {
-    id: `created-${created.agents.length + 1}`,
-    agent,
-    ...resolveModel(draft.spec.declarative?.modelConfig, draft.metadata.namespace),
-    modelConfigRef: draft.spec.declarative?.modelConfig ?? "",
-    tools: draft.spec.declarative?.tools ?? [],
-    memoryRefs: [],
-    deploymentReady: true,
-    accepted: true,
-    agentKind: kind,
-  };
-}
-
-/**
- * The model behind a `modelConfig` reference.
- *
- * The CRD stores it bare — "must be in the same namespace as the Agent" — while
- * the fixtures' own refs are namespaced, so the agent's namespace is what joins
- * the two. A ref that is already namespaced is taken as it stands.
- */
-function resolveModel(
-  ref: string | undefined,
-  namespace: string | undefined,
-): { model: string; modelProvider: string } {
-  if (!ref) return { model: "", modelProvider: "" };
-
-  const qualified = ref.includes("/") ? ref : `${namespace ?? ""}/${ref}`;
-  const config = allModels().find((candidate) => candidate.ref === qualified);
-  return {
-    model: config?.spec.model ?? "",
-    modelProvider: config?.spec.provider ?? "",
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +147,11 @@ const promptSummary = (detail: PromptTemplateDetail): PromptTemplateSummary => (
   namespace: detail.namespace,
   name: detail.name,
   keyCount: Object.keys(detail.data).length,
-  keys: Object.keys(detail.data),
+  // Sorted, because `summarize` in the prompt template service sorts before
+  // answering. Left in insertion order, a library edited through the app came back
+  // with its new key last while the same library re-read from a cluster came back
+  // with it in place — a difference in the fixture, not in the app.
+  keys: Object.keys(detail.data).sort((left, right) => left.localeCompare(right)),
 });
 
 export function savePrompt(detail: PromptTemplateDetail): PromptTemplateDetail {
@@ -424,7 +310,7 @@ const INSTANCE_SHARES_KEY = "kagent.mock.instanceShares";
  */
 export const SEEDED_INSTANCE_SHARE: AgentInstanceShare = {
   id: "mock-instance-share-seed",
-  namespace: "kagent",
+
   agentInstanceId: "6f1c9d20-1b7a-4a1e-9a3f-2c0d8e5b1a44",
   permission: "readOnly",
   createdAt: "2026-08-01T09:00:00Z",
@@ -473,14 +359,12 @@ function readTokens(): Record<string, string> {
 }
 
 export function createInstanceShare(
-  namespace: string,
   agentInstanceId: string,
   permission: AgentInstanceSharePermission,
 ): { share: AgentInstanceShare; token: string } {
   const existing = readInstanceShares();
   const share: AgentInstanceShare = {
     id: `mock-share-${existing.length + 1}`,
-    namespace,
     agentInstanceId,
     permission,
     createdAt: new Date().toISOString(),
@@ -517,13 +401,8 @@ export function revokeInstanceShare(shareId: string): boolean {
 // Agent instances
 // ---------------------------------------------------------------------------
 
-/**
- * How an instance is addressed, and it is not a resource ref.
- *
- * `namespace/id` because that is the pair `AgentInstanceService` takes on every
- * call — an instance has no name, and the id is a UUID scoped to its namespace.
- */
-export const agentInstanceRef = (row: AgentInstance) => `${row.namespace}/${row.id}`;
+/** The UUID used to address a conversation. */
+export const agentInstanceRef = (row: AgentInstance) => row.id;
 
 /**
  * Every instance, with anything suspend or resume has done to it folded in.

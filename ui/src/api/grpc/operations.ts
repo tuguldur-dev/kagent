@@ -1,3 +1,4 @@
+import { ScheduledRunService } from "@/generated/kagent/api/v1alpha1/scheduled_runs_pb";
 /**
  * What each operation id actually calls.
  *
@@ -5,22 +6,11 @@
  * controller's gRPC services plus the conversion between its proto messages and
  * this app's domain types. Nothing above this file names a service or a method.
  *
- * ## The map from ids to RPCs, and the four places it is not one-to-one
+ * ## The map from ids to RPCs
  *
  * Most ids are a single RPC. These are not, and each is a decision rather than a
  * detail:
  *
- * - **`agents.get`** has two RPCs behind it, `GetSandboxAgent` and
- *   `GetAgentHarness`, because a `SandboxAgent` and an `AgentHarness` are
- *   different resources. A caller holding only a namespace and a name — a detail
- *   page reading a URL — cannot know which, so this tries the sandbox first and
- *   falls back to the harness on a `NotFound`. Any other failure is reported as
- *   itself rather than retried, so a permission error does not come back as
- *   "no such agent".
- * - **`agents.update`** is `UpdateSandboxAgent` and nothing else. `AgentHarness`
- *   has **no Update RPC** in `agents.proto`. Asking to update one fails here,
- *   loudly, rather than at the server: the alternative is a request the server
- *   cannot possibly satisfy and an error message about the wrong thing.
  * - **`models.providers`** merges `ListSupportedModelProviders` (the providers the
  *   controller ships with) and `ListConfiguredProviders` (the ones an operator
  *   added). The old REST endpoint returned one list and the UI's provider picker
@@ -34,24 +24,18 @@
  * ## What is not reachable from here
  *
  * `ListProviderModels` (refresh one provider's catalogue),
- * `ListSupportedMemoryProviders`, `ListToolServerTypes`, the MCP-app RPCs
+ * `ListToolServerTypes`, the MCP-app RPCs
  * (`ListMCPAppTools`, `CallMCPAppTool`, `ReadMCPAppResource`), the
- * `AgentHarness` session-actor RPCs and `SystemService`'s `GetVersion` and
- * `GetCurrentUser` all exist on the controller and have no operation id, because
+ * `SystemService`'s `GetVersion` and `GetCurrentUser` exist on the controller and
+ * have no operation id, because
  * nothing in the app calls them yet. Adding one is a new id here, not a new path
  * anywhere else.
  *
- * Four of `AgentInstanceService`'s RPCs are absent for a stronger reason than "not
- * yet". `CreateAgentInstance` needs a harness *and* an AgentTemplate chosen, and
- * `AgentTemplate` has no service to choose one from — it is a shipped CRD that
- * appears in no proto and on no route. `DeleteAgentInstance` is destructive and
- * irreversible. `CheckpointService` — including `ForkAgentInstance` — and the three
- * share RPCs are whole features rather than a control on a list. Each is a product
- * decision, and until one is taken the honest surface is the one that reads and
- * the two lifecycle operations that undo each other.
+ * `CheckpointService` is reached only through **`agentInstances.fork`**, which
+ * creates a checkpoint and forks it in one operation. Listing, naming and restoring
+ * checkpoints need product behaviour first, not a transport mapping here.
  */
 
-import { AgentKind, AgentService } from "@/generated/kagent/api/v1alpha1/agents_pb";
 import { ModelService } from "@/generated/kagent/api/v1alpha1/models_pb";
 import { ToolService } from "@/generated/kagent/api/v1alpha1/tools_pb";
 import { PromptTemplateService } from "@/generated/kagent/api/v1alpha1/prompts_pb";
@@ -68,7 +52,10 @@ import {
 } from "@/generated/kagent/api/v1alpha1/agent_instances_pb";
 import type { AgentInstanceShare as PbAgentInstanceShare } from "@/generated/kagent/api/v1alpha1/agent_instances_pb";
 import type { AgentInstance as PbAgentInstance } from "@/generated/kagent/api/v1alpha1/agent_instances_pb";
-import type { Agent as PbAgent } from "@/generated/kagent/api/v1alpha1/agents_pb";
+import {
+  CheckpointService,
+  CheckpointState as PbCheckpointState,
+} from "@/generated/kagent/api/v1alpha1/checkpoints_pb";
 import type { ToolServer as PbToolServer } from "@/generated/kagent/api/v1alpha1/tools_pb";
 import type {
   GetSubstrateStatusResponse,
@@ -78,7 +65,7 @@ import type {
   SubstrateWorkerPool as PbSubstrateWorkerPool,
 } from "@/generated/kagent/api/v1alpha1/system_pb";
 import type { StructuredObject } from "@/generated/kagent/api/v1alpha1/common_pb";
-import { ApiError, fromConnectError, isNotFound, rethrowIfAborted } from "../ApiError";
+import { ApiError, fromConnectError, rethrowIfAborted } from "../ApiError";
 import { operationContext, serviceClient } from "../transport";
 import {
   KAGENT_API_VERSION,
@@ -90,14 +77,6 @@ import {
   unwrap,
   wrap,
 } from "./wire";
-import type {
-  Agent,
-  AgentCreateRequest,
-  AgentKindName,
-  AgentResponse,
-  Tool,
-} from "../domain/agents";
-import { normaliseAgentResponse } from "../domain/agents";
 import type { ModelConfig, ModelConfigSpec, Provider } from "../domain/models";
 import type {
   ToolServerResponse,
@@ -125,7 +104,6 @@ import type {
 } from "../domain/agentInstances";
 import type {
   ApiOperations,
-  AgentRef,
   OperationCallOptions,
   SubstratePageInput,
 } from "../operations";
@@ -136,7 +114,7 @@ import { createContextValues } from "@connectrpc/connect";
  *
  * `contextValues` is what carries the operation id into the transport, where the
  * interceptor that runs registered transforms can read it — a service and a
- * method are not enough to identify an operation (see `agents.get`).
+ * method are not enough to identify an operation (`models.providers` uses two).
  */
 function call(operation: keyof ApiOperations, options: OperationCallOptions) {
   return {
@@ -158,197 +136,6 @@ async function rpc<T>(
     throw fromConnectError(error, name);
   }
 }
-
-// region Agents
-
-const KIND_BY_ENUM: Record<AgentKind, AgentKindName | "unknown"> = {
-  [AgentKind.UNSPECIFIED]: "unknown",
-  [AgentKind.SANDBOX_AGENT]: "SandboxAgent",
-  [AgentKind.AGENT_HARNESS]: "AgentHarness",
-};
-
-/**
- * One `Agent` message as the row every agent screen reads.
- *
- * The custom resource comes out of `resource.value` unchanged — it is the object
- * as JSON, which is the same thing the REST API used to return — while the
- * resolved fields beside it (`model`, `ready`, the tool list) are the
- * controller's own denormalisation and have no equivalent inside the resource.
- */
-function toAgentRow(agent: PbAgent, rpcName: string): AgentResponse {
-  const resource = unwrap<Agent>(agent.resource, rpcName, "agent resource");
-
-  return normaliseAgentResponse({
-    id: agent.id,
-    agent: resource,
-    model: agent.model,
-    modelProvider: agent.modelProvider,
-    modelConfigRef: refToString(agent.modelConfigRef),
-    tools: list(agent.tools).map((tool) => (tool.value ?? {}) as unknown as Tool),
-    memoryRefs: list(agent.memoryRefs),
-    // Two separate truths the controller reports separately: `accepted` is
-    // "the spec was valid", `ready` is "it is running". A screen showing only one
-    // of them tells half the story, so both are carried.
-    deploymentReady: agent.ready,
-    accepted: agent.accepted,
-    agentKind: KIND_BY_ENUM[agent.kind] ?? "unknown",
-    agentHarness: agent.agentHarness
-      ? {
-          backend: agent.agentHarness.backend,
-          actorId: agent.agentHarness.actorId,
-          backendRefId: agent.agentHarness.backendRefId,
-          endpoint: agent.agentHarness.endpoint,
-          acpPath: agent.agentHarness.acpPath,
-        }
-      : undefined,
-  });
-}
-
-/**
- * Which resource a draft is for.
- *
- * Read from the draft's own `kind`, because that is the only place the answer
- * exists: the create RPCs are per-kind and a form that does not say which kind it
- * built cannot be guessed at. Defaults to `SandboxAgent`, the kind every existing
- * form in this app produces.
- */
-function draftKind(draft: AgentCreateRequest): AgentKindName {
-  return draft.kind === "AgentHarness" ? "AgentHarness" : "SandboxAgent";
-}
-
-const agents: Pick<
-  ApiOperations,
-  "agents.list" | "agents.get" | "agents.create" | "agents.update" | "agents.delete"
-> = {
-  "agents.list": async (input, options) => {
-    const name = "AgentService/ListAgents";
-    const response = await rpc(name, options.signal, () =>
-      serviceClient(AgentService).listAgents(
-        { namespace: input.namespace ?? "" },
-        call("agents.list", options),
-      ),
-    );
-    return list(response.agents).map((agent) => toAgentRow(agent, name));
-  },
-
-  "agents.get": async (input, options) => {
-    if (input.kind === "AgentHarness") return getHarness(input, options);
-    if (input.kind === "SandboxAgent") return getSandbox(input, options);
-
-    // No kind given: the caller holds a URL and nothing else. Sandbox first
-    // because it is the common case, and only a genuine 404 justifies asking
-    // again — anything else is this agent's real answer.
-    try {
-      return await getSandbox(input, options);
-    } catch (error) {
-      if (!isNotFound(error)) throw error;
-      return getHarness(input, options);
-    }
-  },
-
-  "agents.create": async (input, options) => {
-    const kind = draftKind(input.resource);
-    const ref = {
-      namespace: input.resource.metadata.namespace ?? "",
-      name: input.resource.metadata.name,
-    };
-    const resource = wrap(kind, input.resource, input.resource.apiVersion);
-
-    if (kind === "AgentHarness") {
-      const name = "AgentService/CreateAgentHarness";
-      const response = await rpc(name, options.signal, () =>
-        serviceClient(AgentService).createAgentHarness(
-          { ref, resource },
-          call("agents.create", options),
-        ),
-      );
-      return unwrap<Agent>(response.agent?.resource, name, "created agent");
-    }
-
-    const name = "AgentService/CreateSandboxAgent";
-    const response = await rpc(name, options.signal, () =>
-      serviceClient(AgentService).createSandboxAgent(
-        { ref, resource },
-        call("agents.create", options),
-      ),
-    );
-    return unwrap<Agent>(response.agent?.resource, name, "created agent");
-  },
-
-  "agents.update": async (input, options) => {
-    const name = "AgentService/UpdateSandboxAgent";
-    const kind = draftKind(input.resource);
-
-    // Stated here rather than sent and refused, because `agents.proto` has no
-    // UpdateAgentHarness at all — there is no request that could succeed.
-    if (kind === "AgentHarness") {
-      throw new ApiError(
-        "An AgentHarness cannot be edited: the controller offers no update operation for one. " +
-          "Delete it and create it again.",
-        { kind: "http", status: 501, code: "Unimplemented", url: name },
-      );
-    }
-
-    const response = await rpc(name, options.signal, () =>
-      serviceClient(AgentService).updateSandboxAgent(
-        {
-          ref: {
-            namespace: input.resource.metadata.namespace ?? "",
-            name: input.resource.metadata.name,
-          },
-          resource: wrap(kind, input.resource, input.resource.apiVersion),
-        },
-        call("agents.update", options),
-      ),
-    );
-    return unwrap<Agent>(response.agent?.resource, name, "updated agent");
-  },
-
-  "agents.delete": async (input, options) => {
-    const ref = { namespace: input.namespace, name: input.name };
-    const client = serviceClient(AgentService);
-
-    if (input.kind === "AgentHarness") {
-      await rpc("AgentService/DeleteAgentHarness", options.signal, () =>
-        client.deleteAgentHarness({ ref }, call("agents.delete", options)),
-      );
-      return;
-    }
-    await rpc("AgentService/DeleteSandboxAgent", options.signal, () =>
-      client.deleteSandboxAgent({ ref }, call("agents.delete", options)),
-    );
-  },
-};
-
-async function getSandbox(
-  input: AgentRef,
-  options: OperationCallOptions,
-): Promise<AgentResponse> {
-  const name = "AgentService/GetSandboxAgent";
-  const response = await rpc(name, options.signal, () =>
-    serviceClient(AgentService).getSandboxAgent(
-      { ref: { namespace: input.namespace, name: input.name } },
-      call("agents.get", options),
-    ),
-  );
-  return toAgentRow(required(response.agent, name, `agent ${input.namespace}/${input.name}`), name);
-}
-
-async function getHarness(
-  input: AgentRef,
-  options: OperationCallOptions,
-): Promise<AgentResponse> {
-  const name = "AgentService/GetAgentHarness";
-  const response = await rpc(name, options.signal, () =>
-    serviceClient(AgentService).getAgentHarness(
-      { ref: { namespace: input.namespace, name: input.name } },
-      call("agents.get", options),
-    ),
-  );
-  return toAgentRow(required(response.agent, name, `agent ${input.namespace}/${input.name}`), name);
-}
-
-// endregion
 
 // region Models
 
@@ -786,7 +573,7 @@ const INSTANCE_OPERATION_BY_ENUM: Record<
 function toAgentInstance(instance: PbAgentInstance): AgentInstance {
   return {
     id: instance.id,
-    namespace: instance.namespace,
+    contextId: instance.contextId,
     // Carried through as it arrives, empty included: empty means unnamed, which is
     // a state the controller writes deliberately and every row predating the column
     // is in. Turning it into `undefined` here would make every caller handle two
@@ -810,9 +597,6 @@ function toAgentInstance(instance: PbAgentInstance): AgentInstance {
       : undefined,
     createdAt: isoFrom(instance.createdAt),
     updatedAt: isoFrom(instance.updatedAt),
-    // `map<string, string>` is never absent in the generated type, but a
-    // hand-written fake can still omit it.
-    labels: instance.labels ?? {},
   };
 }
 
@@ -856,7 +640,6 @@ const SHARE_PERMISSION_FROM_PB: Partial<
 function toAgentInstanceShare(share: PbAgentInstanceShare): AgentInstanceShare {
   return {
     id: share.id,
-    namespace: share.namespace,
     agentInstanceId: share.agentInstanceId,
     permission: SHARE_PERMISSION_FROM_PB[share.permission] ?? "readOnly",
     createdAt: isoFrom(share.createdAt),
@@ -872,6 +655,7 @@ const agentInstances: Pick<
   | "agentInstances.get"
   | "agentInstances.create"
   | "agentInstances.rename"
+  | "agentInstances.fork"
   | "agentInstances.delete"
   | "agentInstances.suspend"
   | "agentInstances.resume"
@@ -885,24 +669,10 @@ const agentInstances: Pick<
       const response = await rpc(name, options.signal, () =>
         serviceClient(AgentInstanceService).listAgentInstances(
           {
-            namespace: input.namespace,
             allCreators: input.allCreators ?? false,
-            /*
-             * One agent's conversations, narrowed by the server.
-             *
-             * Both fields are optional and either may be given alone. The controller
-             * resolves them through `prepared_revision` to the pair the instance was
-             * built from, so they also select instances stored before the fields
-             * existed — and, more importantly, so the narrowing happens before the
-             * page is cut. Filtering a page after fetching it is the defect the
-             * substrate tables were fixed for: a match on page nine reads as "no
-             * conversations".
-             *
-             * Empty strings rather than absent, because proto3 has no absent string
-             * and the controller reads an empty one as "do not filter".
-             */
-            agentTemplate: input.agentTemplate ?? "",
-            harness: input.harness ?? "",
+
+            agentTemplate: input.agentTemplate,
+            harness: input.harness,
             // No `limit`: the controller's own default (50) is a better answer than
             // a number invented here, and it rejects anything over 100 outright.
             page: { pageToken },
@@ -933,25 +703,11 @@ const agentInstances: Pick<
     );
   },
 
-  /*
-   * Creating an instance is choosing a pair, not filling in a spec.
-   *
-   * `CreateAgentInstanceRequest` is a namespace and two names, because what the
-   * agent *is* lives on the AgentTemplate and how it *runs* lives on the Harness.
-   * There is nothing else for a form here to collect.
-   *
-   * `request_id` is the controller's idempotency key and is required: `validateCreate`
-   * refuses an empty one, or one with surrounding whitespace, or one over 128
-   * characters. It is passed in rather than invented here, because the point of the
-   * key is that a *retry* reuses it — a value generated per call would make every
-   * retry a new instance, which is the opposite of what it is for.
-   */
   "agentInstances.create": async (input, options) => {
     const name = "AgentInstanceService/CreateAgentInstance";
     const response = await rpc(name, options.signal, () =>
       serviceClient(AgentInstanceService).createAgentInstance(
         {
-          namespace: input.namespace,
           harness: input.harness,
           agentTemplate: input.agentTemplate,
           requestId: input.requestId,
@@ -984,11 +740,43 @@ const agentInstances: Pick<
     const name = "AgentInstanceService/UpdateAgentInstanceName";
     const response = await rpc(name, options.signal, () =>
       serviceClient(AgentInstanceService).updateAgentInstanceName(
-        { namespace: input.namespace, agentInstanceId: input.id, name: input.name },
+        { agentInstanceId: input.id, name: input.name },
         call("agentInstances.rename", options),
       ),
     );
     return toAgentInstance(required(response.agentInstance, name, "renamed agent instance"));
+  },
+
+  /*
+   * A checkpoint, then a fork of it. The checkpoint is synchronous: the controller
+   * answers `ready` or `failed`, never `creating`. The same request id serves both
+   * calls, so a retry cannot leave a second checkpoint or a second fork behind.
+   */
+  "agentInstances.fork": async (input, options) => {
+    const checkpoints = serviceClient(CheckpointService);
+    const created = await rpc("CheckpointService/CreateCheckpoint", options.signal, () =>
+      checkpoints.createCheckpoint(
+        { agentInstanceId: input.id, requestId: input.requestId },
+        call("agentInstances.fork", options),
+      ),
+    );
+    const checkpoint = required(created.checkpoint, "CheckpointService/CreateCheckpoint", "checkpoint");
+    if (checkpoint.state !== PbCheckpointState.READY) {
+      throw new ApiError(
+        checkpoint.failure?.message || "The checkpoint did not become ready.",
+        { kind: "http", url: "CheckpointService/CreateCheckpoint", status: 500 },
+      );
+    }
+    const name = "CheckpointService/ForkAgentInstance";
+    const forked = await rpc(name, options.signal, () =>
+      checkpoints.forkAgentInstance(
+        { checkpointId: checkpoint.id, requestId: input.requestId },
+        call("agentInstances.fork", options),
+      ),
+    );
+    const instance = toAgentInstance(required(forked.agentInstance, name, "forked agent instance"));
+    if (!input.name) return instance;
+    return agentInstances["agentInstances.rename"]({ id: instance.id, name: input.name }, options);
   },
 
   /*
@@ -999,7 +787,7 @@ const agentInstances: Pick<
   "agentInstances.delete": async (input, options) => {
     await rpc("AgentInstanceService/DeleteAgentInstance", options.signal, () =>
       serviceClient(AgentInstanceService).deleteAgentInstance(
-        { namespace: input.namespace, agentInstanceId: input.id },
+        { agentInstanceId: input.id },
         call("agentInstances.delete", options),
       ),
     );
@@ -1009,7 +797,7 @@ const agentInstances: Pick<
     const name = "AgentInstanceService/ListAgentInstanceShares";
     const response = await rpc(name, options.signal, () =>
       serviceClient(AgentInstanceService).listAgentInstanceShares(
-        { namespace: input.namespace, agentInstanceId: input.id },
+        { agentInstanceId: input.id },
         call("agentInstances.shares.list", options),
       ),
     );
@@ -1021,7 +809,6 @@ const agentInstances: Pick<
     const response = await rpc(name, options.signal, () =>
       serviceClient(AgentInstanceService).createAgentInstanceShare(
         {
-          namespace: input.namespace,
           agentInstanceId: input.id,
           permission: SHARE_PERMISSION_TO_PB[input.permission],
         },
@@ -1039,7 +826,7 @@ const agentInstances: Pick<
   "agentInstances.shares.revoke": async (input, options) => {
     await rpc("AgentInstanceService/RevokeAgentInstanceShare", options.signal, () =>
       serviceClient(AgentInstanceService).revokeAgentInstanceShare(
-        { namespace: input.namespace, shareId: input.shareId },
+        { shareId: input.shareId },
         call("agentInstances.shares.revoke", options),
       ),
     );
@@ -1049,7 +836,7 @@ const agentInstances: Pick<
     const name = "AgentInstanceService/GetAgentInstance";
     const response = await rpc(name, options.signal, () =>
       serviceClient(AgentInstanceService).getAgentInstance(
-        { namespace: input.namespace, agentInstanceId: input.id },
+        { agentInstanceId: input.id },
         call("agentInstances.get", options),
       ),
     );
@@ -1067,7 +854,7 @@ const agentInstances: Pick<
     const name = "AgentInstanceService/SuspendAgentInstance";
     const response = await rpc(name, options.signal, () =>
       serviceClient(AgentInstanceService).suspendAgentInstance(
-        { namespace: input.namespace, agentInstanceId: input.id },
+        { agentInstanceId: input.id },
         call("agentInstances.suspend", options),
       ),
     );
@@ -1078,7 +865,7 @@ const agentInstances: Pick<
     const name = "AgentInstanceService/ResumeAgentInstance";
     const response = await rpc(name, options.signal, () =>
       serviceClient(AgentInstanceService).resumeAgentInstance(
-        { namespace: input.namespace, agentInstanceId: input.id },
+        { agentInstanceId: input.id },
         call("agentInstances.resume", options),
       ),
     );
@@ -1297,7 +1084,6 @@ function toActorTemplateEntry(
     sandboxClass: orUndefined(template.sandboxClass),
     workerSelector: orUndefined(template.workerSelector),
     harnessName: orUndefined(template.harnessName),
-    managedByKagent: template.managedByKagent,
   };
 }
 
@@ -1430,6 +1216,13 @@ const cluster: Pick<
         if (sortField === "workerPod") {
           return `${actor.ateomPodNamespace ?? ""}/${actor.ateomPodName ?? ""}\0${actor.actorId}`;
         }
+        /*
+         * `status` and `default` are one branch because they are one ordering: the
+         * default *is* status then id, as the field's own type says. So the Status
+         * header changes nothing ascending and reverses the grouping descending, which
+         * is correct and not obvious — named here so that a change to the default order
+         * has to decide what Status means rather than quietly turning it into a no-op.
+         */
         return `${actor.status}\0${actor.actorId}`;
       },
       (actor) =>
@@ -1462,6 +1255,8 @@ const cluster: Pick<
         const pod = `${worker.workerNamespace}/${worker.workerPod}`;
         if (sortField === "pod") return pod;
         if (sortField === "actor") return `${worker.actorId || "\uffff"}\0${pod}`;
+        // `pool` and `default` are one ordering for the reason the actors' `status` is:
+        // the default is pool then pod.
         return `${worker.workerPool}\0${pod}`;
       },
       (worker) =>
@@ -1502,11 +1297,38 @@ function required<T>(value: T | undefined, rpcName: string, what: string): T {
  * declared in `OperationMap` without appearing here — the compiler insists.
  */
 export const defaultOperations: ApiOperations = {
-  ...agents,
   ...agentBuildingBlocks,
   ...models,
   ...toolServers,
   ...prompts,
   ...agentInstances,
   ...cluster,
+  "scheduledRuns.list": async (input, options) => rpc("ListScheduledRuns", options.signal, async () => {
+    const response = await serviceClient(ScheduledRunService).listScheduledRuns(input, call("scheduledRuns.list", options));
+    return { ...response, scheduledRuns: list(response.scheduledRuns) };
+  }),
+  "scheduledRuns.get": async (input, options) => rpc("GetScheduledRun", options.signal, async () => {
+    const response = await serviceClient(ScheduledRunService).getScheduledRun(input, call("scheduledRuns.get", options));
+    return { ...response, scheduledRun: required(response.scheduledRun, "GetScheduledRun", "scheduledRun") };
+  }),
+  "scheduledRuns.create": async (input, options) => rpc("CreateScheduledRun", options.signal, async () => {
+    const response = await serviceClient(ScheduledRunService).createScheduledRun(input, call("scheduledRuns.create", options));
+    return { ...response, scheduledRun: required(response.scheduledRun, "CreateScheduledRun", "scheduledRun") };
+  }),
+  "scheduledRuns.update": async (input, options) => rpc("UpdateScheduledRun", options.signal, async () => {
+    const response = await serviceClient(ScheduledRunService).updateScheduledRun(input, call("scheduledRuns.update", options));
+    return { ...response, scheduledRun: required(response.scheduledRun, "UpdateScheduledRun", "scheduledRun") };
+  }),
+  "scheduledRuns.delete": async (input, options) => rpc("DeleteScheduledRun", options.signal, async () => {
+    const response = await serviceClient(ScheduledRunService).deleteScheduledRun(input, call("scheduledRuns.delete", options));
+    return { ...response, scheduledRun: required(response.scheduledRun, "DeleteScheduledRun", "scheduledRun") };
+  }),
+  "scheduledRuns.trigger": async (input, options) => rpc("TriggerScheduledRun", options.signal, async () => {
+    const response = await serviceClient(ScheduledRunService).triggerScheduledRun(input, call("scheduledRuns.trigger", options));
+    return { ...response, execution: required(response.execution, "TriggerScheduledRun", "execution") };
+  }),
+  "scheduledRuns.executions": async (input, options) => rpc("ListScheduledRunExecutions", options.signal, async () => {
+    const response = await serviceClient(ScheduledRunService).listScheduledRunExecutions(input, call("scheduledRuns.executions", options));
+    return { ...response, executions: list(response.executions) };
+  }),
 };

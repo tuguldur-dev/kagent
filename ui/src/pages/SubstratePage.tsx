@@ -13,12 +13,16 @@ import {
   Tooltip,
   Typography,
 } from "antd";
+import type { TableProps } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { useTheme } from "@emotion/react";
+import type { SortOrder } from "antd/es/table/interface";
+import { useTheme, type CSSObject, type Theme } from "@emotion/react";
+import { useThemeMode } from "@/theme/themeMode";
 import { Radio, Search } from "lucide-react";
 import { PageFrame } from "@/components/Structure/PageFrame";
 import { StatTile } from "@/components/dashboard/StatTile";
 import { RefreshButton } from "@/components/table/RefreshButton";
+import { PageControls, usePageStack } from "@/components/table/PageControls";
 import {
   useNamespaces,
   useSubstrateActors,
@@ -29,6 +33,7 @@ import {
   type SubstrateSortOrder,
   type SubstrateWorkerSortField,
   type SubstrateActorTemplateEntry,
+  type SubstrateStatusCount,
   type SubstrateWorkerEntry,
   type SubstrateWorkerPoolEntry,
 } from "@/api";
@@ -50,10 +55,11 @@ const GROWING_TABLE_HEIGHT = 420;
 /**
  * The interval polling starts at, in seconds.
  *
- * A second is quick enough to watch an actor move between workers and slow enough to
- * leave running while reading, which is what this control is for.
+ * Half a second is quick enough to watch an actor move between workers, which is what
+ * this control is for. It is also the floor below, so the default is the fastest this
+ * page will ask — a reader who turns polling on wants to see the cluster move.
  */
-const DEFAULT_POLL_SECONDS = 1;
+const DEFAULT_POLL_SECONDS = 0.5;
 
 /**
  * The fastest this page will ask, in seconds.
@@ -95,7 +101,25 @@ const NAMESPACE_PARAM = "namespace";
 const ALL_NAMESPACES = "";
 
 /**
- * What a status or phase is telling you, as four readings rather than a dozen strings.
+ * A wire enum as a word: `ACTOR_STATE_CRASHED` reads as `Crashed`.
+ *
+ * The controller names the states it knows, but falls back to the protobuf constant for
+ * any it does not, so an unmapped state reaches this page as a wire symbol. Proto names
+ * every value after its own enum, and that prefix only repeats the column header, so it
+ * goes rather than being spelled out as `Actor state crashed`.
+ *
+ * Anything not shaped like a constant is returned untouched: a status the controller has
+ * already written for a reader must not be rewritten by a guess about its casing.
+ */
+function humanizeEnum(label: string): string {
+  const value = label.trim();
+  if (!/^[A-Z][A-Z0-9]*(_[A-Z0-9]+)+$/.test(value)) return value;
+  const words = value.replace(/^[A-Z0-9]+_STATE_/, "").toLowerCase().replace(/_/g, " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/**
+ * What a status or phase is telling you, as five readings rather than a dozen strings.
  *
  * The substrate's vocabulary is not a closed enum on the wire: `phase` and `status` are
  * plain strings that ate-api and the ActorTemplate controller each fill in their own way,
@@ -103,39 +127,60 @@ const ALL_NAMESPACES = "";
  * `neutral` and is shown as it arrived — inventing a colour for a word this page has
  * never seen would be a claim about health nobody made.
  */
-type StatusTone = "healthy" | "warning" | "progress" | "idle" | "neutral";
+type StatusTone = "healthy" | "danger" | "warning" | "progress" | "idle" | "neutral";
 
 function statusTone(label: string): StatusTone {
-  const value = label.trim().toLowerCase();
+  const value = humanizeEnum(label).trim().toLowerCase();
   if (value === "ready" || value === "running") return "healthy";
-  if (value === "failed" || value === "suspending") return "warning";
-  if (value === "suspended" || value === "unknown" || value === "") return "idle";
-  // Substrings, because these arrive spelled several ways: `Resuming`, `WaitingForWorker`,
-  // `GoldenSnapshotPending`. All of them mean the same thing to a reader — something is
-  // under way and the next read will say something different.
-  if (value.includes("resume") || value.includes("wait") || value.includes("golden")) {
+  // A crashed or failed actor is not a caution, it is the thing that went wrong.
+  if (value === "failed" || value === "crashed") return "danger";
+  // Deletion is in flight like the transitions below and is checked before them, because
+  // it is the one that does not come back: an actor that reads the same shade as one
+  // taking a snapshot is an actor nobody looks at twice.
+  if (value.includes("delet")) return "warning";
+  // `idle` among them because that is the word the workers table already uses for a pod
+  // holding no actor, and a parked worker and a parked actor are the same news.
+  if (
+    value === "suspended" ||
+    value === "paused" ||
+    value === "idle" ||
+    value === "unknown" ||
+    value === ""
+  ) {
+    return "idle";
+  }
+  // Shapes rather than words, because these arrive spelled several ways: `Resuming`,
+  // `Suspending`, `WaitingForWorker`, `GoldenSnapshotPending`. All of them mean the same
+  // thing to a reader — something is under way and the next read will say otherwise.
+  if (value.endsWith("ing") || value.includes("wait") || value.includes("golden")) {
     return "progress";
   }
   return "neutral";
 }
 
 /**
- * A status, coloured by what it means.
+ * Each tone's three colours, the theme's own rather than antd's presets.
  *
- * The triples are the theme's own rather than antd's presets, for the reason the palette
- * states: antd derives a tag's three colours from one foreground token on the assumption
- * of a light page. `primary` is not among them in any tone — it is a fill chosen to carry
- * light text, and as ink on this page it measures about 2.2:1.
+ * antd derives a tag's three from one foreground token on the assumption of a light
+ * page. `primary` is not among them in any tone — it is a fill chosen to carry light
+ * text, and as ink on this page it measures about 2.2:1.
+ *
+ * `color` is the saturated one and the only one that carries meaning on its own: the
+ * fills are near-identical tints, about ΔE 3 apart, so a stripe painted with them
+ * would read as one stripe. That is what the bar below fills with, and it is why the
+ * bar and the chips read the same status the same way.
  */
-function StatusChip({ label }: { label: string }) {
-  const theme = useTheme();
-  const tone = statusTone(label);
-
-  const pill = {
+function statusPalette(theme: Theme): Record<StatusTone, CSSObject> {
+  return {
     healthy: {
       background: theme.color.successBg,
       borderColor: theme.color.successBorder,
       color: theme.color.successText,
+    },
+    danger: {
+      background: theme.color.dangerBg,
+      borderColor: theme.color.dangerBorder,
+      color: theme.color.dangerText,
     },
     warning: {
       background: theme.color.warningBg,
@@ -149,7 +194,9 @@ function StatusChip({ label }: { label: string }) {
     },
     idle: {
       background: theme.color.bgElevated,
-      borderColor: theme.color.border,
+      // `borderStrong` and not `border`: the hairline token is the app's dividers, and at
+      // 1.4:1 it is a decorative edge rather than a boundary. This one measures 3.5:1.
+      borderColor: theme.color.borderStrong,
       color: theme.color.textMuted,
     },
     neutral: {
@@ -157,7 +204,15 @@ function StatusChip({ label }: { label: string }) {
       borderColor: theme.color.borderStrong,
       color: theme.color.text,
     },
-  }[tone];
+  };
+}
+
+/** A status, coloured by what it means. */
+function StatusChip({ label }: { label: string }) {
+  const theme = useTheme();
+  const tone = statusTone(label);
+  const text = humanizeEnum(label);
+  const pill = statusPalette(theme)[tone];
 
   return (
     <Tag
@@ -166,9 +221,9 @@ function StatusChip({ label }: { label: string }) {
         /*
          * The substrate's vocabulary is open-ended: `phase` and `status` are plain
          * strings, and a value this build has never seen is shown as it arrived. Some
-         * of them are long — a cluster answered with `ACTOR_STATE_CRASHED`, which at
-         * one line overflowed its column and printed itself across the next one. So
-         * the tag wraps inside the width it is given rather than spilling out of it.
+         * of them are long — `WaitingForWorker` at one line overflowed its column and
+         * printed itself across the next one. So the tag wraps inside the width it is
+         * given rather than spilling out of it.
          */
         whiteSpace: "normal",
         maxWidth: "100%",
@@ -176,8 +231,344 @@ function StatusChip({ label }: { label: string }) {
       }}
       data-tone={tone}
     >
-      {label.trim() === "" ? "not reported" : label}
+      {text === "" ? "not reported" : text}
     </Tag>
+  );
+}
+
+/**
+ * A count at a glance: 999 stays 999, 1,100 becomes `1.1k`.
+ *
+ * The legend and the bar are read sideways, and a cluster answered with 410,110 actors —
+ * a row of exact figures there is a row nobody reads. The exact numbers stay where they
+ * are acted on: the tiles, the section counts and the table.
+ *
+ * `K` lowercased because that is the convention for thousands; `M` and above are left as
+ * `Intl` writes them, where uppercase is the convention instead.
+ */
+const compactNumber = new Intl.NumberFormat(undefined, {
+  notation: "compact",
+  maximumFractionDigits: 1,
+});
+const atAGlance = (count: number) => compactNumber.format(count).replace("K", "k");
+
+/**
+ * Every actor state a controller can report, so the legend is the vocabulary rather than
+ * today's sample: a reader learns that `Crashed` is a thing that happens by seeing it at
+ * zero, not by waiting for one.
+ *
+ * Mirrors `ActorStatusLabel` in `go/core/internal/substrate/list.go`, which names the
+ * `ate.dev` `ActorState` enum. Drift is not a failure here: this decides only what is
+ * listed at zero, and any state the controller reports that is missing from it is added
+ * to the legend from the data — so a new one appears the first time it happens.
+ */
+const ACTOR_STATES = [
+  "Crashed",
+  "Deleting",
+  "Pausing",
+  "Resuming",
+  "Running",
+  "Snapshotting",
+  "Suspending",
+  "Paused",
+  "Suspended",
+  "Unknown",
+];
+
+/**
+ * How many actors the bar will draw one segment each for.
+ *
+ * A segment per actor is what makes the bar countable — eight ticks with two green is
+ * read, not estimated. It stops being countable long before it stops being drawable, and
+ * a cluster answered with 410,110 actors, so past this the bar falls back to one
+ * proportional band per status. The number is where counting gives out, not where the
+ * browser does.
+ */
+const ACTORS_DRAWN_INDIVIDUALLY = 80;
+
+/**
+ * The whole actor inventory as one bar, coloured by what each actor is doing.
+ *
+ * Two running of ten with the rest suspended is two green segments and eight grey. The
+ * tile above says how many are running; only this says what the other eight are doing,
+ * and with the table paged it is the one place the whole distribution appears at all — a
+ * reader on page one of 410,110 actors has otherwise no way to learn that most of them
+ * have crashed.
+ *
+ * The fills are the pills' own text colours, so an actor is the same colour here as in
+ * the table. Not the pills' fills: those are near-identical tints about ΔE 3 apart, and a
+ * bar painted with them would read as one long smudge.
+ */
+function StatusBar({
+  counts,
+  title,
+  caption,
+  emptyText,
+  testId,
+  vocabulary,
+  noun,
+  unread,
+}: {
+  counts: SubstrateStatusCount[];
+  /** Every status worth listing at zero. Anything counted but missing is added to it. */
+  vocabulary: string[];
+  /** What is being counted, for the places with room to say it: `Actors`, `Workers`. */
+  noun: string;
+  /** True when the read failed, so nothing here is a count of anything. */
+  unread?: boolean;
+  /**
+   * The bar's accessible name, announced with its breakdown. Not drawn: the legend
+   * beneath already names every colour on it, and a heading over a card that is already
+   * called "Actors" would only say it twice.
+   */
+  title: string;
+  /** What this bar is counting, when it is not simply the whole scope. */
+  caption?: string;
+  emptyText: string;
+  testId: string;
+}) {
+  const theme = useTheme();
+  const { mode } = useThemeMode();
+  const dark = mode === "dark";
+  const palette = statusPalette(theme);
+  // Short in the legend, where the swatch and the column already say what is counted.
+  const read = (entry: SubstrateStatusCount) =>
+    `${entry.status || "not reported"}: ${atAGlance(entry.count)}`;
+  // Long wherever the reading stands on its own — `Suspended Actors: 6` rather than a
+  // number under a status a tooltip has floated away from.
+  const readFull = (entry: SubstrateStatusCount) =>
+    `${entry.status || "Not reported"} ${noun}: ${atAGlance(entry.count)}`;
+
+  /*
+   * Counted by the word rather than by the wire value.
+   *
+   * A controller that has learned a state sends `Crashed` and one that has not sends
+   * `ACTOR_STATE_CRASHED`; both read as `Crashed`, and keyed by the raw string they came
+   * out as two entries — the legend listed `Crashed` twice, once at zero.
+   */
+  const merged = new Map<string, number>();
+  for (const entry of counts) {
+    const key = humanizeEnum(entry.status);
+    merged.set(key, (merged.get(key) ?? 0) + entry.count);
+  }
+
+  /*
+   * Grouped by status and ordered by the word, with everything parked pushed to the end.
+   *
+   * Idle is where a bar's dead weight belongs: a cluster that is mostly suspended reads as
+   * a short band of activity against a long grey tail, rather than having the interesting
+   * part cut in half by it. Sorted here rather than trusted from the server, because a bar
+   * whose segments reorder between polls is a bar nobody can point at.
+   */
+  const order = (entries: SubstrateStatusCount[]) =>
+    [...entries].sort((a, b) => {
+      const parked = (entry: SubstrateStatusCount) => (statusTone(entry.status) === "idle" ? 1 : 0);
+      return parked(a) - parked(b) || a.status.localeCompare(b.status);
+    });
+  const entries = [...merged].map(([status, count]) => ({ status, count }));
+  const present = order(entries.filter((entry) => entry.count > 0));
+  const total = present.reduce((sum, entry) => sum + entry.count, 0);
+  const perActor = total > 0 && total <= ACTORS_DRAWN_INDIVIDUALLY;
+  const summary = [caption, present.map(readFull).join(", ")].filter(Boolean).join(". ");
+
+  // The one place a tone becomes two colours, so a legend key and the segment it explains
+  // are the same colour by construction rather than by two expressions agreeing.
+  const paint = (tone: StatusTone): CSSObject => ({
+    /*
+     * The pill's own three colours, not a mix of one of them with the page.
+     *
+     * Mixing toward the page is what turned these grey: every tone converges on the
+     * background as the fill weakens, so at a subtle strength they all read as the same
+     * washed-out slab. Taking the pill's fill and the pill's own border instead makes a
+     * segment the same colour as the chip in the row below by construction, rather than
+     * by two sets of numbers agreeing — and both are lighter than the mix was.
+     */
+    background: `color-mix(in srgb, ${palette[tone].color} var(--seg-fill), ${palette[tone].background})`,
+    border: `1px solid ${palette[tone].borderColor}`,
+  });
+
+  const segment = (tone: StatusTone, key: string, grow: number, first: boolean, last: boolean) => (
+    <div
+      key={key}
+      data-tone={tone}
+      css={{
+        /* The pill's own colour, as a wash behind its own outline. Both are mixed toward
+           the page rather than used at full strength — which dims them on a dark page and
+           lightens them on a light one, from one expression. At full strength eight of
+           these is a row of paint chips.
+           The strengths come from the track's own custom properties, so hovering the bar
+           deepens every segment at once without any of them having to know the tone. */
+        ...paint(tone),
+        flexGrow: grow,
+        flexBasis: 0,
+        /* One crashed actor in 410,110 is 0.0002% of the width: without a floor it is not
+           a pixel, let alone something to point at — and it is the most important thing
+           on the bar. */
+        minWidth: 6,
+        height: 18,
+        // Only the two ends are rounded, so the row reads as one bar rather than as a
+        // line of separate lozenges.
+        borderRadius: `${first ? 4 : 0}px ${last ? 4 : 0}px ${last ? 4 : 0}px ${first ? 4 : 0}px`,
+        boxSizing: "border-box",
+        transition: "background 120ms, border-color 120ms",
+      }}
+    />
+  );
+
+  const track = (
+    <div
+      data-testid={testId}
+      /* The tooltip needs a pointer, which a screen reader has not got and a keyboard
+         cannot produce. So the same summary is the bar's own name — colour and hover are
+         never the only things carrying it. */
+      role="img"
+      aria-label={total === 0 ? emptyText : `${title}. ${summary}`}
+      css={{
+        display: "flex",
+        gap: 3,
+        minHeight: 18,
+        /* Hover only: pointing at the bar reveals the breakdown, but nothing happens on
+           press, and an active state would promise that it does.
+           Deepening the mix rather than brightening it: `brightness` on a fill that is
+           mostly page colour washes it out to the page instead of strengthening it, which
+           on a light theme reads as the segments going transparent. */
+        ":hover": { "--seg-fill": dark ? "30%" : "22%" },
+      }}
+    >
+      {present
+        .flatMap((entry) => {
+          const tone = statusTone(entry.status);
+          return perActor
+            ? Array.from({ length: entry.count }, (_, i) => ({ tone, key: `${entry.status}-${i}`, grow: 1 }))
+            : [{ tone, key: entry.status, grow: entry.count }];
+        })
+        .map((part, index, all) =>
+          segment(part.tone, part.key, part.grow, index === 0, index === all.length - 1),
+        )}
+    </div>
+  );
+
+  /*
+   * The legend, in the bar's own order and colours.
+   *
+   * The bar says the proportions and the legend says the numbers; between them a reader
+   * gets both without hovering anything, which is what a tooltip alone cannot give
+   * someone reading a screenshot or printing the page.
+   */
+  const keys = order(
+    [...new Set([...vocabulary.map(humanizeEnum), ...merged.keys()])].map((status) => ({
+      status,
+      count: merged.get(status) ?? 0,
+    })),
+  );
+
+  const legend = (
+    <div
+      data-testid={`${testId}-legend`}
+      css={{ display: "flex", flexWrap: "wrap", gap: "2px 4px", marginTop: 8 }}
+    >
+      {keys.map((entry) => (
+        <span
+          key={entry.status}
+          css={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            fontSize: 12,
+            /* The padding and the radius are the same whether or not anything holds this
+               status, and only the fill changes: a highlight that added weight or space
+               would move every key beside it each time a count crossed zero, on a page
+               that polls. */
+            padding: "2px 8px",
+            borderRadius: 6,
+            // A key is something to read past, not text to drag through: selecting it while
+            // sweeping the pointer along the row is never what anyone meant.
+            userSelect: "none",
+            background: entry.count === 0 ? "transparent" : theme.color.bgElevated,
+          }}
+        >
+          {/* A status nothing is in is still worth listing, and still worth being the
+              quietest thing here — but the fading is mostly the swatch's job. The text at
+              the swatch's own opacity measured 3.79:1 on a light page, under AA; at 0.95
+              it is 4.64:1 there and 7.20:1 on a dark one, and still visibly the quieter. */}
+          <span
+            aria-hidden
+            css={{
+              ...paint(statusTone(entry.status)),
+              width: 10,
+              height: 10,
+              borderRadius: 3,
+              opacity: entry.count === 0 ? 0.45 : 1,
+            }}
+          />
+          <Text
+            css={{
+              color: entry.count === 0 ? theme.color.textMuted : theme.color.text,
+              fontSize: 12,
+              opacity: entry.count === 0 ? 0.95 : 1,
+            }}
+          >
+            {read(entry)}
+          </Text>
+        </span>
+      ))}
+    </div>
+  );
+
+  return (
+    /* The empty row keeps its height, with the reason beneath it. A bar that vanished when
+       a search stopped matching would move the table under a reader at the moment they
+       were reading why. */
+    <div
+      css={{
+        marginBottom: 6,
+        /* Declared here rather than on the bar, because the legend keys are painted from
+           the same expressions and are the bar's siblings: on the track they resolved to
+           nothing outside it, and every key came out invisible.
+
+           At rest this is the pill's fill exactly; hovering pulls it toward the pill's own
+           saturated colour, further on a dark page where the same step shows less. */
+        "--seg-fill": "0%",
+      }}
+    >
+      {total === 0 ? (
+        <>
+          {track}
+          {/* Silent when the read failed: the banner above already says so, and "no actors
+              in this scope" under a broken backend reports a healthy empty cluster. The
+              legend stays either way — it is ten keys and two rows tall, and dropping it
+              as the last actor drains moves the table under whoever is reading it. */}
+          {unread ? null : (
+            <Text
+              data-testid={`${testId}-empty`}
+              css={{ color: theme.color.textMuted, fontSize: 12, display: "block", marginTop: 8 }}
+            >
+              {emptyText}
+            </Text>
+          )}
+          {legend}
+        </>
+      ) : (
+        <Tooltip
+          title={
+            <>
+              {caption ? <div css={{ opacity: 0.75 }}>{caption}</div> : null}
+              {present.map((entry) => (
+                <div key={entry.status}>{readFull(entry)}</div>
+              ))}
+            </>
+          }
+        >
+          {/* The bar and its legend under one tooltip: they are the same reading, and a
+              breakdown reachable from the chart but not from the key that explains it is
+              a breakdown half the pointers on the page will miss. */}
+          <div>
+            {track}
+            {legend}
+          </div>
+        </Tooltip>
+      )}
+    </div>
   );
 }
 
@@ -294,16 +685,6 @@ function SectionSearch({
   );
 }
 
-/** Where a section's rows come from, said once beside the section rather than per row. */
-function SectionHint({ children }: { children: string }) {
-  const theme = useTheme();
-  return (
-    <Text css={{ color: theme.color.textMuted, fontSize: 12, fontWeight: 400 }}>
-      {children}
-    </Text>
-  );
-}
-
 /**
  * The Agent Substrate's own inventory.
  *
@@ -346,137 +727,103 @@ function useDebounced<T>(value: T, delayMs: number): T {
   return settled;
 }
 
+/** One paged table's order: which column, and which way. */
+type PagedSort<Field extends string> = {
+  field: Field | "default";
+  order: SubstrateSortOrder;
+};
+
 /**
- * A paged section's position, as a stack of the tokens that got us here.
+ * What antd should draw on a column's header, from the order that was applied.
  *
- * A stack rather than a page number, because the API pages by token: the only way
- * back to the previous page is the token that produced it. Reset whenever the
- * question changes — a new filter or a new scope makes every token meaningless,
- * and reusing one would ask for "the page after a row that is no longer in the
- * result".
+ * The header is antd's own — the whole cell is the target, and the direction is its
+ * pair of chevrons — because a page where two tables sort by clicking a header and two
+ * more by clicking the words inside one is a page a reader has to learn twice.
+ *
+ * What is not antd's is the sorting: the columns below declare `sorter: true`, the form
+ * that gives a column that header and leaves the table no comparator to run. That is
+ * right here, but for the opposite reason to the one this comment used to give. No
+ * order is sent anywhere — `GetSubstrateStatus` takes a namespace and nothing else —
+ * so the read hands back the whole inventory and `localPage` orders all of it before
+ * slicing out a page. The ordering is already over every row, and a comparator would
+ * re-sort the hundred on screen: one page out of 410,110 reordered is not the cluster
+ * sorted, and the first row of the sorted set is almost certainly not on it.
  */
-function usePageStack(resetKey: string) {
-  const [state, setState] = useState<{ key: string; tokens: string[] }>({
-    key: resetKey,
-    tokens: [],
-  });
+function sortDirectionFor<Field extends string>(
+  sort: PagedSort<Field>,
+  field: Field,
+): SortOrder | null {
+  if (sort.field !== field) return null;
+  return sort.order === "asc" ? "ascend" : "descend";
+}
 
-  /*
-   * The reset is derived, not performed.
-   *
-   * Clearing the stack from an effect would be a `setState` inside one — a cascading
-   * render, and the rule that forbids it is right — and it would also render one
-   * frame of the *old* page against the new question before correcting itself.
-   * Reading the key alongside the tokens means a changed question is already on the
-   * first page in the render that discovers it.
-   */
-  const tokens = state.key === resetKey ? state.tokens : [];
+/**
+ * A paged table's `onChange`, routed into the order it is read in.
+ *
+ * antd cycles a header ascending → descending → unsorted, and the third of those is
+ * the table's default order rather than no order at all: these rows arrive sorted by
+ * something whatever happens, and `default` is the grouping they fall back to.
+ *
+ * `columnKey` carries the sort field, so a column's key and the field it orders by are
+ * the same string by construction — see the column definitions.
+ */
+function pagedSortChange<Row, Field extends string>(
+  apply: (sort: PagedSort<Field>) => void,
+): NonNullable<TableProps<Row>["onChange"]> {
+  return (_pagination, _filters, sorter, extra) => {
+    if (extra.action !== "sort") return;
+    // An array under antd's multi-sort. These tables are single-sort — the read
+    // orders by one column — and taking the first entry keeps this correct if that
+    // ever changes: the order sent is then the column the reader chose last.
+    const active = Array.isArray(sorter) ? sorter[0] : sorter;
+    const field = active?.columnKey;
 
-  return {
-    /** The token for the page being shown. Empty is the first page. */
-    current: tokens.length > 0 ? tokens[tokens.length - 1] : "",
-    pageNumber: tokens.length + 1,
-    canGoBack: tokens.length > 0,
-    next: (token: string) =>
-      setState({ key: resetKey, tokens: [...tokens, token] }),
-    back: () => setState({ key: resetKey, tokens: tokens.slice(0, -1) }),
+    if (!active?.order || typeof field !== "string") {
+      apply({ field: "default", order: "asc" });
+      return;
+    }
+    apply({
+      field: field as Field,
+      order: active.order === "ascend" ? "asc" : "desc",
+    });
   };
 }
 
 /**
- * A column header that asks the *server* to sort.
+ * Which order the rows on screen are in, said beside the table.
  *
- * Not antd's own `sorter`, deliberately. That reorders the rows the table was
- * given, which for one page out of hundreds of thousands looks like sorting and is
- * not — the first row of the sorted cluster is almost certainly not on this page.
- * So the header sends the column and the direction, and the rows come back ordered.
+ * "Across the whole inventory" is the claim worth making, and it is the true one: the
+ * read fetches every row and orders all of them before this page gets a slice, so the
+ * order holds over the cluster rather than over the hundred rows in front of the
+ * reader. It does not say the server sorted them, because nothing asks the server to —
+ * that sentence stood here over a client-side sort.
  *
- * Clicking cycles ascending → descending → back to the default order, so a reader
- * can undo a sort without knowing which column was the default one.
+ * The order comes back on the response rather than being assumed from the control, so
+ * what is claimed is what was applied. The age is here for a related reason: these
+ * reads are memoised for a fraction of a second, and a page that showed cached numbers
+ * while claiming to poll would be the polling bug this codebase has already shipped
+ * once.
  */
-function SortableHeader<Field extends string>({
-  title,
-  field,
-  sort,
-  onSort,
-}: {
-  title: string;
-  field: Field;
-  sort: { field: Field | "default"; order: SubstrateSortOrder };
-  onSort: (field: Field | "default", order: SubstrateSortOrder) => void;
-}) {
-  const theme = useTheme();
-  const isActive = sort.field === field;
-  const arrow = !isActive ? "" : sort.order === "asc" ? " ↑" : " ↓";
-
-  return (
-    <button
-      type="button"
-      data-testid={`substrate-sort-${field}`}
-      data-active={isActive}
-      data-order={isActive ? sort.order : undefined}
-      onClick={() => {
-        if (!isActive) onSort(field, "asc");
-        else if (sort.order === "asc") onSort(field, "desc");
-        else onSort("default", "asc");
-      }}
-      css={{
-        all: "unset",
-        cursor: "pointer",
-        fontWeight: 600,
-        color: isActive ? theme.color.primaryText : "inherit",
-        "&:hover": { color: theme.color.primaryText },
-      }}
-    >
-      {title}
-      {arrow}
-    </button>
-  );
-}
-
 /**
- * What the server actually did, said beside the table.
+ * How old the rows are.
  *
- * The order applied comes back on the response rather than being assumed from the
- * control, so a request the server did not honour reads as what it did rather than
- * as what was asked for. The age is here for the same reason: these reads are
- * memoised for a fraction of a second, and a page that showed cached numbers while
- * claiming to poll would be the polling bug this codebase has already shipped once.
+ * The controller memoises these reads, so a table that has not changed and a read that
+ * is not happening look identical without this.
  */
-function ServerOrder({
-  field,
-  order,
-  computedAt,
-  labels,
-  testId,
-}: {
-  field: string;
-  order: SubstrateSortOrder;
-  computedAt?: string;
-  labels: Record<string, string>;
-  testId: string;
-}) {
+function ReadAge({ computedAt, testId }: { computedAt?: string; testId: string }) {
   const theme = useTheme();
   const age = useDataAge(computedAt);
+  // Nothing rather than an empty line: a controller that did not say when it read leaves
+  // a gap under the table otherwise.
+  if (!age) return null;
 
   return (
-    <Text
-      data-testid={testId}
-      css={{ color: theme.color.textMuted, fontSize: 12 }}
-    >
-      Sorted by the server: {labels[field] ?? field}
-      {order === "desc" ? ", descending" : ", ascending"}
-      {age ? ` · ${age}` : ""}
+    <Text data-testid={testId} css={{ color: theme.color.textMuted, fontSize: 12 }}>
+      {age}
     </Text>
   );
 }
 
-/**
- * How old an answer is, in words, ticking as it ages.
- *
- * A clock of its own, because nothing else re-renders while the page sits idle: a
- * stale figure with no ticking age beside it is indistinguishable from a live one.
- */
 function useDataAge(computedAt: string | undefined): string {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -490,54 +837,6 @@ function useDataAge(computedAt: string | undefined): string {
   const seconds = Math.max(0, (now - at) / 1000);
   if (seconds < 1) return "read just now";
   return `read ${seconds.toFixed(1)}s ago`;
-}
-
-/** Previous and Next for one paged section, with the page number between them. */
-function PageControls({
-  testId,
-  page,
-  hasNext,
-  onNext,
-  onBack,
-  isLoading,
-}: {
-  testId: string;
-  page: { pageNumber: number; canGoBack: boolean };
-  hasNext: boolean;
-  onNext: () => void;
-  onBack: () => void;
-  isLoading: boolean;
-}) {
-  const theme = useTheme();
-
-  // Nothing to page through: one page and no way off it. Hidden rather than shown
-  // disabled, because two dead buttons under a five-row table read as a broken
-  // control rather than as a complete list.
-  if (!hasNext && !page.canGoBack) return null;
-
-  return (
-    <Space size={8} css={{ marginTop: theme.space(3) }} data-testid={testId}>
-      <Button
-        size="small"
-        disabled={!page.canGoBack || isLoading}
-        onClick={onBack}
-        data-testid={`${testId}-prev`}
-      >
-        Previous
-      </Button>
-      <Text css={{ color: theme.color.textMuted, fontSize: 12 }}>
-        Page {page.pageNumber}
-      </Text>
-      <Button
-        size="small"
-        disabled={!hasNext || isLoading}
-        onClick={onNext}
-        data-testid={`${testId}-next`}
-      >
-        Next
-      </Button>
-    </Space>
-  );
 }
 
 /**
@@ -616,17 +915,18 @@ export function SubstratePage() {
   const workerFilter = useDebounced(workerQuery.trim(), FILTER_DEBOUNCE_MS);
 
   /*
-   * The order each paged table is read in, sent to the server rather than applied
-   * here — see `SortableHeader` for why a local sort would be a lie at this size.
+   * The order each paged table is read in, applied by the read rather than by the
+   * table — see `sortDirectionFor` for why sorting the page in hand would be a lie at
+   * this size, and `useSubstrateActors` for what carrying it in the read key costs.
    */
-  const [actorSort, setActorSort] = useState<{
-    field: SubstrateActorSortField;
-    order: SubstrateSortOrder;
-  }>({ field: "default", order: "asc" });
-  const [workerSort, setWorkerSort] = useState<{
-    field: SubstrateWorkerSortField;
-    order: SubstrateSortOrder;
-  }>({ field: "default", order: "asc" });
+  const [actorSort, setActorSort] = useState<PagedSort<SubstrateActorSortField>>({
+    field: "default",
+    order: "asc",
+  });
+  const [workerSort, setWorkerSort] = useState<PagedSort<SubstrateWorkerSortField>>({
+    field: "default",
+    order: "asc",
+  });
 
   // A new order is a new result, so the page stack resets with it — a token from
   // the previous order names a row's position in an ordering that no longer holds.
@@ -781,9 +1081,46 @@ export function SubstratePage() {
     [inventory?.actorTemplates, templateQuery],
   );
 
-  const actorRows = actors.error ? [] : (actors.data?.actors ?? []);
-  const workerRows = workers.error ? [] : (workers.data?.workers ?? []);
+  /* Memoised so the two bars below have a stable dependency: both branches allocate a new
+     array, so an inline expression changed identity on every render and the memos it fed
+     recomputed every tick — which is the one thing they exist to avoid. */
+  const actorRows = useMemo(
+    () => (actors.error ? [] : (actors.data?.actors ?? [])),
+    [actors.error, actors.data?.actors],
+  );
 
+  /*
+   * What the bar above the actor table counts.
+   *
+   * Unfiltered it is the summary's own counts, which is the only honest source of a whole
+   * cluster: the table holds one page, and a page counted and drawn as the cluster would
+   * report eight actors for a deployment running 410,110.
+   *
+   * A search has no server-side breakdown, so the matches are counted here from the rows
+   * that came back — and those are also a page. `actorBarCaption` is what stops the bar
+   * claiming the rest: it says how many of the matches are actually in it.
+   */
+  const actorBar = useMemo(() => {
+    if (!actorFilter) {
+      return { counts: inventory?.actorStatusCounts ?? [], caption: undefined as string | undefined };
+    }
+    const byStatus = new Map<string, number>();
+    for (const actor of actorRows) {
+      byStatus.set(actor.status, (byStatus.get(actor.status) ?? 0) + 1);
+    }
+    const matches = actors.data?.totalSize ?? actorRows.length;
+    return {
+      counts: [...byStatus].map(([status, count]) => ({ status, count })),
+      caption:
+        actorRows.length < matches
+          ? `Matching “${actorFilter}”: ${atAGlance(actorRows.length)} of ${atAGlance(matches)} shown`
+          : `Matching “${actorFilter}”: ${atAGlance(matches)}`,
+    };
+  }, [actorFilter, actorRows, actors.data?.totalSize, inventory?.actorStatusCounts]);
+  const workerRows = useMemo(
+    () => (workers.error ? [] : (workers.data?.workers ?? [])),
+    [workers.error, workers.data?.workers],
+  );
   /*
    * The tiles, from the summary's own counts.
    *
@@ -822,10 +1159,10 @@ export function SubstratePage() {
    * headers sorts by both. The numbers are a fixed priority rather than click order,
    * so they are chosen to put the column worth *grouping* by first.
    *
-   * The actor and worker tables have no sorters at all any more, and that is the
-   * honest consequence of paging: a client-side sorter reorders the page it was
-   * given, which looks like sorting and is not — the first row of the sorted cluster
-   * is almost certainly not on this page. The server's order is stated instead.
+   * A comparator here rather than a read, because these two lists arrive whole: the
+   * summary carries every pool and every template, so sorting them in the browser
+   * sorts all of them. The paged tables below wear the same header and mean something
+   * different by it — see `sortDirectionFor`.
    */
   const workerPoolColumns: ColumnsType<SubstrateWorkerPoolEntry> = useMemo(
     () => [
@@ -915,71 +1252,64 @@ export function SubstratePage() {
   );
 
   /*
-   * Every column asks the server to sort, and none of them sorts locally.
+   * Every column orders the whole inventory, and none of them sorts the page locally.
    *
-   * antd's own `sorter` is deliberately absent: it reorders the rows the table was
-   * handed, and one page out of 410,110 reordered is not the cluster sorted.
+   * `sorter: true` rather than a comparator: it is the form that gives a column antd's
+   * own header — the whole cell clickable, the direction in its chevrons, the same as
+   * the two tables above — while leaving the table nothing to reorder. A click becomes
+   * the next read, which orders every row before slicing this page out of it; see
+   * `sortDirectionFor` for why that is not the same as sorting on the server.
+   *
+   * Each column's `key` *is* its sort field, which is what lets the change handler send
+   * `columnKey` straight on — so the type says so, and a key that is not one of them
+   * fails to compile rather than silently sorting by nothing. That is the shape that
+   * let `pod` stand where `workerPod` belonged.
    */
-  const actorColumns: ColumnsType<SubstrateActorEntry> = useMemo(
+  const actorColumns: (ColumnsType<SubstrateActorEntry>[number] & {
+    key: SubstrateActorSortField;
+  })[] = useMemo(
     () => [
       {
-        title: (
-          <SortableHeader
-            title="Actor"
-            field="actorId"
-            sort={actorSort}
-            onSort={(field, order) => setActorSort({ field, order })}
-          />
-        ),
+        title: "Actor",
         key: "actorId",
-        width: 320,
+        sorter: true,
+        sortOrder: sortDirectionFor(actorSort, "actorId"),
+        width: 300,
         render: (_, actor) => <span css={mono}>{actor.actorId}</span>,
       },
       {
-        title: (
-          <SortableHeader
-            title="Status"
-            field="status"
-            sort={actorSort}
-            onSort={(field, order) => setActorSort({ field, order })}
-          />
-        ),
+        title: "Status",
         key: "status",
-        // Wide enough for the longest status seen on a real cluster
-        // (`ACTOR_STATE_CRASHED`) without wrapping it to three lines.
-        width: 190,
+        sorter: true,
+        sortOrder: sortDirectionFor(actorSort, "status"),
+        // Wide enough for `Snapshotting`. It was 190 while `ACTOR_STATE_CRASHED` could
+        // reach the page; words are shorter than the constants, so the columns fit.
+        width: 130,
         render: (_, actor) => <StatusChip label={actor.status} />,
       },
       {
-        title: (
-          <SortableHeader
-            title="Template"
-            field="template"
-            sort={actorSort}
-            onSort={(field, order) => setActorSort({ field, order })}
-          />
-        ),
+        title: "Template",
         key: "template",
-        width: 260,
+        sorter: true,
+        sortOrder: sortDirectionFor(actorSort, "template"),
+        width: 240,
         render: (_, actor) =>
           actor.actorTemplateName
             ? qualified(actor.actorTemplateNamespace, actor.actorTemplateName)
             : "—",
       },
       {
-        title: (
-          <SortableHeader
-            title="Worker pod"
-            field="workerPod"
-            sort={actorSort}
-            onSort={(field, order) => setActorSort({ field, order })}
-          />
-        ),
-        key: "pod",
-        width: 320,
+        title: "Worker pod",
+        key: "workerPod",
+        sorter: true,
+        sortOrder: sortDirectionFor(actorSort, "workerPod"),
+        width: 260,
         render: (_, actor) =>
           actor.ateomPodName ? (
-            <Text css={{ ...mono, ...muted }}>
+            /* One line, always. A pod name and an IP together outrun the column, and
+               wrapping them made the row two lines tall — which moves every row under it,
+               on a page that polls. It runs into the slack on its right instead. */
+            <Text css={{ ...mono, ...muted, whiteSpace: "nowrap" }}>
               {actor.ateomPodNamespace ?? ""}/{actor.ateomPodName}
               {actor.ateomPodIp ? ` · ${actor.ateomPodIp}` : ""}
             </Text>
@@ -991,44 +1321,32 @@ export function SubstratePage() {
     [actorSort, mono, muted, qualified],
   );
 
-  const workerColumns: ColumnsType<SubstrateWorkerEntry> = useMemo(
+  /** The same, for the workers: antd's header, the order the read applied. */
+  const workerColumns: (ColumnsType<SubstrateWorkerEntry>[number] & {
+    key: SubstrateWorkerSortField;
+  })[] = useMemo(
     () => [
       {
-        title: (
-          <SortableHeader
-            title="Pod"
-            field="pod"
-            sort={workerSort}
-            onSort={(field, order) => setWorkerSort({ field, order })}
-          />
-        ),
+        title: "Pod",
         key: "pod",
+        sorter: true,
+        sortOrder: sortDirectionFor(workerSort, "pod"),
         width: 360,
         render: (_, worker) => qualified(worker.workerNamespace, worker.workerPod),
       },
       {
-        title: (
-          <SortableHeader
-            title="Pool"
-            field="pool"
-            sort={workerSort}
-            onSort={(field, order) => setWorkerSort({ field, order })}
-          />
-        ),
+        title: "Pool",
         key: "pool",
+        sorter: true,
+        sortOrder: sortDirectionFor(workerSort, "pool"),
         width: 220,
         render: (_, worker) => worker.workerPool,
       },
       {
-        title: (
-          <SortableHeader
-            title="Actor"
-            field="actor"
-            sort={workerSort}
-            onSort={(field, order) => setWorkerSort({ field, order })}
-          />
-        ),
+        title: "Actor",
         key: "actor",
+        sorter: true,
+        sortOrder: sortDirectionFor(workerSort, "actor"),
         width: 360,
         // "idle" rather than a dash: a worker with no actor on it is available, which
         // is a state worth reading, where a dash says only that a cell is empty.
@@ -1257,13 +1575,6 @@ export function SubstratePage() {
             hint={unread}
           />
           <StatTile
-            label="ate-api"
-            testId="substrate-stat-ateapi"
-            value={inventory ? (ateApiEnabled ? "connected" : "off") : undefined}
-            isLoading={summary.isLoading}
-            hint={unread}
-          />
-          <StatTile
             label="Scope"
             testId="substrate-stat-scope"
             // Not read from the response — it is what this page asked for, which is
@@ -1272,21 +1583,6 @@ export function SubstratePage() {
             value={namespace === ALL_NAMESPACES ? "all" : namespace}
           />
         </div>
-
-        {/* Every actor status, not only the running tally.
-            Knowing that 1 of 410,110 actors is running says nothing about the other
-            410,109 — and on this cluster what it does not say is that most of them
-            have crashed. The summary counts them all, so the page can. */}
-        {inventory && inventory.actorStatusCounts.length > 1 ? (
-          <Space size={6} wrap data-testid="substrate-actor-status-counts">
-            <Text css={{ ...muted, fontSize: 12 }}>Actors by status</Text>
-            {inventory.actorStatusCounts.map((entry) => (
-              <Tag key={entry.status} css={mono}>
-                {entry.status || "not reported"}: {entry.count.toLocaleString()}
-              </Tag>
-            ))}
-          </Space>
-        ) : null}
 
         <Card
           title={
@@ -1298,7 +1594,6 @@ export function SubstratePage() {
           }
           extra={
             <Space size={8}>
-              <SectionHint>Kubernetes WorkerPool resources</SectionHint>
               <SectionSearch
                 label="Search worker pools"
                 testId="substrate-pools-search"
@@ -1335,7 +1630,6 @@ export function SubstratePage() {
           }
           extra={
             <Space size={8}>
-              <SectionHint>Golden snapshots and harness-owned templates</SectionHint>
               <SectionSearch
                 label="Search actor templates"
                 testId="substrate-templates-search"
@@ -1372,7 +1666,6 @@ export function SubstratePage() {
           }
           extra={
             <Space size={8}>
-              <SectionHint>Live state from ate-api, one page at a time</SectionHint>
               <SectionSearch
                 label="Search actors"
                 testId="substrate-actors-search"
@@ -1398,15 +1691,39 @@ export function SubstratePage() {
             />
           ) : null}
 
+          <StatusBar
+            testId="substrate-actor-status-counts"
+            title="Actor status"
+            vocabulary={ACTOR_STATES}
+            noun="Actors"
+            unread={Boolean(summary.error || actors.error)}
+            counts={actorBar.counts}
+            caption={actorBar.caption}
+            emptyText={
+              actorFilter
+                ? "No actors match your search."
+                : ateApiEnabled
+                  ? "No actors in this scope."
+                  : "ate-api is not configured, so there are no actors to show."
+            }
+          />
+
           <Table<SubstrateActorEntry>
             data-testid="substrate-actors-table"
             rowKey={(actor) => actor.actorId}
             columns={actorColumns}
             dataSource={actorRows}
             loading={actors.isLoading}
+            onChange={pagedSortChange<SubstrateActorEntry, SubstrateActorSortField>(
+              setActorSort,
+            )}
+            /* antd's own pager is off because the pages come from the server by token,
+               not by number — `PageControls` below turns them. */
             pagination={false}
             virtual
-            scroll={{ y: GROWING_TABLE_HEIGHT, x: 1040 }}
+            /* The sum of the column widths, so the table asks for exactly what it uses:
+               a wider `x` reserves space no column wants and scrolls the card for it. */
+            scroll={{ y: GROWING_TABLE_HEIGHT, x: 930 }}
             size="small"
             /* Three different sentences, because they are three different facts and
                only one is something to act on: a controller with no ate-api endpoint
@@ -1424,18 +1741,9 @@ export function SubstratePage() {
             }}
           />
 
-          <ServerOrder
+          <ReadAge
             testId="substrate-actors-order"
-            field={actors.data?.appliedSortField ?? "default"}
-            order={actors.data?.appliedSortOrder ?? "asc"}
             computedAt={actors.data?.computedAt}
-            labels={{
-              default: "status, then actor",
-              status: "status",
-              actorId: "actor",
-              template: "template",
-              workerPod: "worker pod",
-            }}
           />
 
           <PageControls
@@ -1458,7 +1766,6 @@ export function SubstratePage() {
           }
           extra={
             <Space size={8}>
-              <SectionHint>ateom pod assignments</SectionHint>
               <SectionSearch
                 label="Search workers"
                 testId="substrate-workers-search"
@@ -1484,7 +1791,7 @@ export function SubstratePage() {
             />
           ) : null}
 
-          <Table<SubstrateWorkerEntry>
+<Table<SubstrateWorkerEntry>
             data-testid="substrate-workers-table"
             rowKey={(worker) =>
               `${worker.workerNamespace}/${worker.workerPool}/${worker.workerPod}`
@@ -1492,6 +1799,9 @@ export function SubstratePage() {
             columns={workerColumns}
             dataSource={workerRows}
             loading={workers.isLoading}
+            onChange={pagedSortChange<SubstrateWorkerEntry, SubstrateWorkerSortField>(
+              setWorkerSort,
+            )}
             pagination={false}
             virtual
             scroll={{ y: GROWING_TABLE_HEIGHT, x: 940 }}
@@ -1507,17 +1817,9 @@ export function SubstratePage() {
             }}
           />
 
-          <ServerOrder
+          <ReadAge
             testId="substrate-workers-order"
-            field={workers.data?.appliedSortField ?? "default"}
-            order={workers.data?.appliedSortOrder ?? "asc"}
             computedAt={workers.data?.computedAt}
-            labels={{
-              default: "pool, then pod",
-              pool: "pool",
-              pod: "pod",
-              actor: "actor",
-            }}
           />
 
           <PageControls
