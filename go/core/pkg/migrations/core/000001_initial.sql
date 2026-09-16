@@ -42,6 +42,8 @@ CREATE TABLE runtime_revision (
     created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     agent_card               BYTEA       NOT NULL,
+    -- Logical deletion; retain the row until ActorTemplate cleanup completes.
+    deleted_at               TIMESTAMPTZ,
     CONSTRAINT runtime_revision_actor_template_namespace_actor_template_na_key
         UNIQUE (actor_template_atespace, actor_template_name)
 );
@@ -171,7 +173,7 @@ CREATE TABLE agent_instance_task_event (
     data       BYTEA       NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     message_id TEXT,
-    -- Creation events retain the metadata needed to rebuild task indexes.
+    -- Creation events retain task indexes; admitted reply messages retain retry hashes.
     task_position BIGINT,
     initial_message_id TEXT,
     request_hash BYTEA,
@@ -181,7 +183,8 @@ CREATE TABLE agent_instance_task_event (
     CHECK ((snapshot_atespace IS NULL AND snapshot_uri IS NULL AND snapshot_content_scope IS NULL)
         OR (snapshot_atespace IS NOT NULL AND snapshot_uri IS NOT NULL AND snapshot_content_scope IS NOT NULL)),
     CHECK (task_position IS NULL OR (task_position > 0 AND task_id IS NOT NULL AND message_id IS NULL)),
-    CHECK (task_position IS NOT NULL OR (initial_message_id IS NULL AND request_hash IS NULL))
+    CHECK (task_position IS NOT NULL OR initial_message_id IS NULL),
+    CHECK (request_hash IS NULL OR task_position IS NOT NULL OR message_id IS NOT NULL)
 );
 CREATE UNIQUE INDEX agent_instance_task_event_creation_idx
     ON agent_instance_task_event (history_id, task_id) WHERE task_position IS NOT NULL;
@@ -241,10 +244,26 @@ CREATE INDEX scheduled_run_execution_history_idx ON scheduled_run_execution (sch
 CREATE INDEX scheduled_run_execution_pending_idx ON scheduled_run_execution (next_attempt_at, id)
     WHERE state IN ('SCHEDULED_RUN_EXECUTION_STATE_PENDING', 'SCHEDULED_RUN_EXECUTION_STATE_RUNNING');
 
+CREATE VIEW unreferenced_runtime_revision AS
+SELECT r.revision FROM runtime_revision r
+WHERE NOT EXISTS (
+    SELECT 1 FROM agent_template_harness_pair p
+    WHERE p.retired_at IS NULL
+      AND (p.desired_revision = r.revision OR p.latest_successful_revision = r.revision)
+)
+AND NOT EXISTS (
+    SELECT 1 FROM agent_instance i WHERE i.prepared_revision = r.revision
+)
+AND NOT EXISTS (
+    SELECT 1 FROM agent_instance_checkpoint c WHERE c.prepared_revision = r.revision
+);
+
 -- +goose Down
 
 DROP TABLE scheduled_run_execution;
 DROP TABLE scheduled_run;
+DROP VIEW unreferenced_runtime_revision;
+
 DROP TABLE agent_instance_share;
 DROP TABLE agent_instance_task_event;
 DROP TABLE agent_instance_task;

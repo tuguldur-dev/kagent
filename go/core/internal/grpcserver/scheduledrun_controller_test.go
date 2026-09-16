@@ -18,6 +18,7 @@ import (
 	"github.com/kagent-dev/kagent/go/core/internal/controller/scheduledrun"
 	"github.com/kagent-dev/kagent/go/core/internal/database"
 	authimpl "github.com/kagent-dev/kagent/go/core/internal/httpserver/auth"
+	"github.com/kagent-dev/kagent/go/core/internal/substrate"
 	"github.com/kagent-dev/kagent/go/core/pkg/auth"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -52,7 +53,7 @@ func (w *scheduledControllerWorkflow) Create(ctx context.Context, instance *apiv
 	next := proto.CloneOf(instance)
 	next.State = apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_READY
 	next.Operation = apiv1alpha1.AgentInstanceOperation_AGENT_INSTANCE_OPERATION_UNSPECIFIED
-	next.A2AAuthority = "scheduled-runtime.test"
+	next.A2AAuthority = substrate.ActorHost("team", substrate.ActorName(instance.GetId()), "")
 	return w.store.TransitionAgentInstance(ctx, next,
 		apiv1alpha1.AgentInstanceState_AGENT_INSTANCE_STATE_CREATING,
 		apiv1alpha1.AgentInstanceOperation_AGENT_INSTANCE_OPERATION_CREATE)
@@ -72,6 +73,10 @@ func (w *scheduledControllerWorkflow) Quiesce(context.Context, *apiv1alpha1.Agen
 		return nil, errors.New("temporary Substrate outage")
 	}
 	return &database.AgentInstanceTaskSnapshot{Atespace: "team", URI: "s3://snapshots/snapshot", ContentScope: "FULL"}, nil
+}
+
+func (w *scheduledControllerWorkflow) Pause(context.Context, *apiv1alpha1.AgentInstance) error {
+	return nil
 }
 
 type scheduledControllerAuth struct {

@@ -101,7 +101,7 @@ func (c *Client) CreateAgentInstance(ctx context.Context, request *apiv1alpha1.A
 // template/harness pair's latest successful revision. Callers must supply a transaction so
 // the history and instance commit together. A missing prepared target returns ErrNotFound;
 // a duplicate creator/requestID returns pgx.ErrNoRows for the caller to resolve.
-func insertAgentInstance(ctx context.Context, db dbExecutor, request *apiv1alpha1.AgentInstance, requestID string) (agentInstanceRow, error) {
+func insertAgentInstance(ctx context.Context, db pgx.Tx, request *apiv1alpha1.AgentInstance, requestID string) (agentInstanceRow, error) {
 	type preparedRevision struct {
 		Revision string
 		DBTime   time.Time
@@ -122,6 +122,9 @@ func insertAgentInstance(ctx context.Context, db dbExecutor, request *apiv1alpha
 	)
 	if err != nil {
 		return agentInstanceRow{}, fmt.Errorf("get latest successful runtime revision: %w", notFoundOr(err))
+	}
+	if _, err := getAvailableRuntimeRevisionForUpdate(ctx, db, revision.Revision); err != nil {
+		return agentInstanceRow{}, err
 	}
 	instance := proto.CloneOf(request)
 	contextID, historyID := uuid.New(), uuid.New()
@@ -238,8 +241,8 @@ func (c *Client) UpdateAgentInstanceName(ctx context.Context, id, userID, name s
 
 // TransitionAgentInstance changes lifecycle fields only if the stored state and operation
 // match the expected values. A mismatch, or a creating checkpoint when starting a new
-// operation, returns ErrAgentInstanceConflict. It preserves other instance fields; callers
-// choose a valid transition and authorize it.
+// operation, returns ErrConflict. Starting explicit Suspend also requires no active task.
+// It preserves other instance fields; callers choose a valid transition and authorize it.
 func (c *Client) TransitionAgentInstance(
 	ctx context.Context,
 	instance *apiv1alpha1.AgentInstance,
@@ -257,7 +260,7 @@ func (c *Client) TransitionAgentInstance(
 			return err
 		}
 		if result.State != expectedState || result.Operation != expectedOperation {
-			return ErrAgentInstanceConflict
+			return fmt.Errorf("AgentInstance lifecycle state or operation changed: %w", ErrConflict)
 		}
 		// Only lifecycle fields belong to this operation. Keep concurrent renames,
 		// immutable indexed fields and unknown protobuf fields from the locked row.
@@ -283,6 +286,17 @@ func (c *Client) TransitionAgentInstance(
 			      WHERE c.source_instance_id = agent_instance.id AND c.state = 'CREATING'
 			    )
 			  )
+			  AND (
+			    $2::text <> 'AGENT_INSTANCE_OPERATION_SUSPEND'
+			    OR $6::text <> 'AGENT_INSTANCE_OPERATION_UNSPECIFIED'
+			    OR NOT EXISTS (
+			      SELECT 1 FROM agent_instance_task t
+			      WHERE t.history_id = agent_instance.history_id
+			        AND t.state NOT IN ('TASK_STATE_COMPLETED', 'TASK_STATE_CANCELED',
+			            'TASK_STATE_FAILED', 'TASK_STATE_REJECTED',
+			            'TASK_STATE_INPUT_REQUIRED', 'TASK_STATE_AUTH_REQUIRED')
+			    )
+			  )
 		`,
 			next.State.String(),
 			next.Operation.String(), data, row.ID, expectedState.String(),
@@ -292,7 +306,7 @@ func (c *Client) TransitionAgentInstance(
 			return err
 		}
 		if tag.RowsAffected() != 1 {
-			return ErrAgentInstanceConflict
+			return fmt.Errorf("AgentInstance %s has an active task or checkpoint being created: %w", instance.GetId(), ErrConflict)
 		}
 		result = next
 		return nil

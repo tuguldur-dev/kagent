@@ -1,10 +1,11 @@
-import { Button, Dropdown, Typography } from "antd";
-import { GitFork, MoreVertical } from "lucide-react";
+import { Typography } from "antd";
 import { useTheme } from "@emotion/react";
 import { ExtensionSlot } from "@/appExtensions";
 import type { ChatMessage } from "@/api";
 import { ToolCallCard } from "./ToolCallCard";
 import { MarkdownMessage } from "./MarkdownMessage";
+import { ToolApprovalRecord } from "./ToolApprovalRecord";
+import { AskUserRecord } from "./AskUserRecord";
 import { isAwaitingContent, messageText } from "./messageText";
 
 const { Text } = Typography;
@@ -15,31 +16,27 @@ const { Text } = Typography;
  * A message can hold several parts, so this renders each part in order rather
  * than picking one shape per message — a turn that calls a tool and then
  * explains itself is one message in the transport's terms.
+ *
+ * A saved boundary is not drawn here: it falls *between* messages, so the transcript
+ * draws `CheckpointDivider` after the turn it was taken at.
  */
 export function ChatMessageItem({
   message,
   sessionId,
-  onFork,
-  isForkable = false,
+  isCheckpointed = false,
 }: {
   message: ChatMessage;
   /** The conversation this message belongs to, for the per-message extension point. */
   sessionId?: string;
-  /**
-   * Forks the conversation. Drawn only on the reader's own messages, and only when a
-   * surface provides this — so a read-only view has no control that would be refused.
-   */
-  onFork?: () => void;
-  /**
-   * Whether a fork can actually start from this message.
-   *
-   * True for the reader's latest message only, because a checkpoint is taken at the
-   * conversation's latest turn boundary and nowhere else.
-   */
-  isForkable?: boolean;
+  /** Whether this message is above the nearest saved boundary, for the browser suite. */
+  isCheckpointed?: boolean;
 }) {
   const theme = useTheme();
   const isUser = message.role === "user";
+  // A completed question is a transcript summary and keeps the full notification
+  // lane. Tool approval decisions are direct user responses, so they deliberately
+  // retain the ordinary right-aligned, content-sized user lane.
+  const isQuestionRecord = message.parts.some((part) => part.kind === "ask_user");
   const text = messageText(message);
 
   return (
@@ -47,10 +44,11 @@ export function ChatMessageItem({
       data-testid="chat-message"
       data-message-id={message.id}
       data-role={message.role}
+      data-checkpointed={isCheckpointed || undefined}
       css={{
         display: "grid",
         gap: theme.space(2),
-        justifyItems: isUser ? "end" : "start",
+        justifyItems: isUser && !isQuestionRecord ? "end" : "start",
       }}
     >
       <div
@@ -79,57 +77,15 @@ export function ChatMessageItem({
             sessionId,
           }}
         />
-        {/*
-          On the reader's own messages, and enabled only on the latest of them.
-
-          `CreateCheckpoint` takes no cutoff, so a fork can only start from the
-          conversation's latest turn boundary. The menu is still drawn on the earlier
-          ones, disabled: that is where forking belongs once a boundary can be chosen,
-          and a control that silently forked the whole conversation from a message
-          halfway up would be worse than one that says it cannot.
-        */}
-        {onFork && isUser ? (
-          <Dropdown
-            trigger={["click"]}
-            menu={{
-              items: [
-                {
-                  key: "fork",
-                  icon: <GitFork size={13} />,
-                  label: "Fork chat",
-                  disabled: !isForkable,
-                  title: isForkable
-                    ? undefined
-                    : "Only the latest message can be forked from for now.",
-                  onClick: isForkable ? onFork : undefined,
-                },
-              ],
-            }}
-          >
-            <Button
-              type="text"
-              size="small"
-              data-testid={`chat-message-menu-${message.id}`}
-              aria-label="Message actions"
-              icon={<MoreVertical size={14} color={theme.color.textMuted} />}
-              css={{
-                // Hidden until the message is hovered or the button has focus, so a
-                // transcript reads as a conversation rather than a column of controls.
-                opacity: 0,
-                transition: "opacity 100ms ease",
-                "article:hover &, &:focus-visible, &[aria-expanded='true']": { opacity: 1 },
-              }}
-            />
-          </Dropdown>
-        ) : null}
       </div>
 
       <div
+        data-testid="chat-message-content"
         css={{
           maxWidth: "min(80ch, 100%)",
           display: "grid",
           gap: theme.space(2),
-          width: isUser ? "auto" : "100%",
+          width: isUser && !isQuestionRecord ? "auto" : "100%",
         }}
       >
         {message.parts.map((part, index) =>
@@ -157,8 +113,12 @@ export function ChatMessageItem({
                 {isUser ? part.text : <MarkdownMessage>{part.text}</MarkdownMessage>}
               </div>
             ) : null
-          ) : (
+          ) : part.kind === "data" ? (
             <ToolCallCard key={index} part={part} />
+          ) : part.kind === "tool_approval" ? (
+            <ToolApprovalRecord key={index} part={part} />
+          ) : (
+            <AskUserRecord key={index} part={part} />
           ),
         )}
 
