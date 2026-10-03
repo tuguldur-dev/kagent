@@ -1,3 +1,5 @@
+import { RuntimeState, RuntimeOperation } from "@/generated/kagent/api/v1alpha1/runtime_pb";
+import { ActorState, SandboxClass } from "@/generated/ateapi_pb";
 /**
  * Every operation, exercised against the real gRPC services running in-process.
  *
@@ -24,17 +26,18 @@
  */
 
 import { afterEach, describe, expect, it } from "vitest";
+import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError, createRouterTransport } from "@connectrpc/connect";
 import type { ConnectRouter } from "@connectrpc/connect";
 import { ModelService } from "@/generated/kagent/api/v1alpha1/models_pb";
 import { ToolService } from "@/generated/kagent/api/v1alpha1/tools_pb";
 import { PromptTemplateService } from "@/generated/kagent/api/v1alpha1/prompts_pb";
-import { SystemService } from "@/generated/kagent/api/v1alpha1/system_pb";
 import {
-  AgentInstanceOperation as PbAgentInstanceOperation,
-  AgentInstanceService,
-  AgentInstanceState as PbAgentInstanceState,
-} from "@/generated/kagent/api/v1alpha1/agent_instances_pb";
+  SystemService,
+} from "@/generated/kagent/api/v1alpha1/system_pb";
+import {
+  SessionService,
+} from "@/generated/kagent/api/v1alpha1/sessions_pb";
 import { ApiError, isNotFound } from "./ApiError";
 import { apiClient } from "./client";
 import { clearApiExtensions } from "./extensionPoints";
@@ -55,10 +58,10 @@ describe("model configurations", () => {
   const modelConfigMessage = (name: string, model: string) => ({
     ref: { namespace: "kagent", name },
     resource: {
-      apiVersion: "kagent.dev/v1alpha3",
+      apiVersion: "api.kagent.dev/v1alpha3",
       kind: "ModelConfig",
       value: {
-        apiVersion: "kagent.dev/v1alpha3",
+        apiVersion: "api.kagent.dev/v1alpha3",
         kind: "ModelConfig",
         metadata: { name, namespace: "kagent" },
         spec: { model, provider: "OpenAI" },
@@ -213,7 +216,7 @@ describe("tool servers and tools", () => {
           toolServers: [
             {
               ref: "kagent/kagent-tool-server",
-              groupKind: "RemoteMCPServer.kagent.dev",
+              groupKind: "RemoteMCPServer.api.kagent.dev",
               discoveredTools: [{ name: "k8s_get_resources", description: "read" }],
             },
           ],
@@ -224,7 +227,7 @@ describe("tool servers and tools", () => {
     expect(await apiClient.mcpServers.list()).toEqual([
       {
         ref: "kagent/kagent-tool-server",
-        groupKind: "RemoteMCPServer.kagent.dev",
+        groupKind: "RemoteMCPServer.api.kagent.dev",
         discoveredTools: [{ name: "k8s_get_resources", description: "read" }],
       },
     ]);
@@ -238,7 +241,7 @@ describe("tool servers and tools", () => {
           received = request;
           return {
             resource: {
-              apiVersion: "kagent.dev/v1alpha3",
+              apiVersion: "api.kagent.dev/v1alpha3",
               kind: "RemoteMCPServer",
               value: { metadata: { name: "extra", namespace: "kagent" } },
             },
@@ -263,13 +266,43 @@ describe("tool servers and tools", () => {
     expect(received).toMatchObject({
       type: "RemoteMCPServer",
       ref: { namespace: "kagent", name: "extra" },
-      resource: { kind: "RemoteMCPServer" },
+      resource: { kind: "RemoteMCPServer", apiVersion: "api.kagent.dev/v1alpha3" },
     });
     expect(created.ref).toBe("kagent/extra");
-    expect(created.groupKind).toBe("RemoteMCPServer.kagent.dev");
+    expect(created.groupKind).toBe("RemoteMCPServer.api.kagent.dev");
     // Empty because it is: the controller has not handshaken with the server yet,
     // and inventing tools here would put unconfirmed ones on screen.
     expect(created.discoveredTools).toEqual([]);
+  });
+
+  it("keeps KMCP servers in their own API group", async () => {
+    let received: unknown;
+    serve(({ service }) => {
+      service(ToolService, {
+        createToolServer: (request) => {
+          received = request;
+          return { resource: request.resource };
+        },
+      });
+    });
+
+    const created = await apiClient.mcpServers.create({
+      type: "MCPServer",
+      mcpServer: {
+        metadata: { name: "local", namespace: "kagent" },
+        spec: {
+          deployment: { image: "example.com/mcp:latest", port: 8080 },
+          transportType: "stdio",
+          stdioTransport: {},
+        },
+      },
+    });
+
+    expect(received).toMatchObject({
+      type: "MCPServer",
+      resource: { kind: "MCPServer", apiVersion: "kagent.dev/v1alpha1" },
+    });
+    expect(created.groupKind).toBe("MCPServer.kagent.dev");
   });
 
   /**
@@ -289,7 +322,7 @@ describe("tool servers and tools", () => {
                 value: {
                   id: "k8s_get_resources",
                   server_name: "kagent-tool-server",
-                  group_kind: "RemoteMCPServer.kagent.dev",
+                  group_kind: "RemoteMCPServer.api.kagent.dev",
                   created_at: "2026-01-01T00:00:00Z",
                   updated_at: "2026-01-01T00:00:00Z",
                   description: "read resources",
@@ -369,26 +402,146 @@ describe("the cluster", () => {
   it("returns the substrate inventory, and a partial-data warning as a warning", async () => {
     serve(({ service }) => {
       service(SystemService, {
-        getSubstrateStatus: () => ({
-          enabled: true,
+        getSubstrateSummary: () => ({
           ateApiError: "ate-api list calls failed",
           workerPools: [
-            { namespace: "kagent", name: "pool", replicas: 2, ateomImage: "ateom:1" },
+            {
+              ref: { namespace: "kagent", name: "pool" },
+              resource: {
+                apiVersion: "ate.dev/v1alpha1", kind: "WorkerPool",
+                value: {
+                  metadata: { namespace: "kagent", name: "pool" },
+                  spec: { replicas: 2, workerImage: "ateom:1" },
+                  status: { replicas: 1, readyReplicas: 1 },
+                },
+              },
+            },
           ],
-          actorTemplates: [{ namespace: "kagent", name: "tpl", phase: "Ready" }],
-          actors: [{ actorId: "a1", atespace: "kagent", status: "Running", version: 3n }],
-          workers: [],
+          actorTemplates: [
+            {
+              metadata: { atespace: "kagent", name: "tpl", uid: "golden-actor" },
+              status: {
+                goldenSnapshotStatus: {
+                  goldenTag: { atespace: "ate-golden", name: "golden" },
+                },
+              },
+              sandboxConfig: { sandboxClass: SandboxClass.GVISOR },
+              workerSelector: { matchLabels: { zone: "east", pool: "agents" } },
+            },
+          ],
+        }),
+        listSubstrateActors: () => ({
+          actors: [{
+            metadata: { name: "a1", atespace: "kagent", version: 3n },
+            actorTemplate: { atespace: "team", name: "tpl", uid: "template-uid" },
+            status: {
+              state: ActorState.RUNNING,
+              workerAssignment: {
+                workerNamespace: "kagent",
+                workerPod: "worker-0",
+                workerPool: "pool",
+                workerPodIp: "10.0.0.1",
+              },
+              externalSnapshot: { snapshotUri: "s3://snapshot" },
+              inProgressLocalSnapshotName: "next-snapshot",
+            },
+          }],
         }),
       });
     });
 
-    const status = await apiClient.substrate.status();
-    expect(status.enabled).toBe(true);
+    const [summary, actors] = await Promise.all([apiClient.substrate.summary(), apiClient.substrate.actors({})]);
+    expect(summary.workerPools).toEqual([{ namespace: "kagent", name: "pool", replicas: 2, ateomImage: "ateom:1" }]);
+    expect(summary.actorTemplates[0]).toEqual({
+      atespace: "kagent",
+      name: "tpl",
+      phase: "Ready",
+      goldenTag: "ate-golden/golden",
+      sandboxClass: "gvisor",
+      workerSelector: "pool=agents,zone=east",
+    });
     // The request succeeded; the runtime halves may be incomplete. That is a
     // message to put beside the data, not an error to throw.
-    expect(status.ateApiError).toMatch(/ate-api/);
-    expect(status.actors[0].atespace).toBe("kagent");
-    expect(status.actors[0].version).toBe(3);
+    expect(summary.ateApiError).toMatch(/ate-api/);
+    expect(actors.actors[0]).toEqual({
+      actorId: "a1",
+      atespace: "kagent",
+      status: "Running",
+      actorTemplateAtespace: "team",
+      actorTemplateName: "tpl",
+      ateomPodNamespace: "kagent",
+      ateomPodName: "worker-0",
+      ateomPodIp: "10.0.0.1",
+      latestSnapshot: "s3://snapshot",
+      workerPoolName: "pool",
+      inProgressSnapshot: "next-snapshot",
+      version: 3,
+    });
+  });
+
+  it.each([
+    { goldenSnapshotStatus: undefined, phase: "Pending" },
+    { goldenSnapshotStatus: { errorMessage: "warmup failed" }, phase: "Failed" },
+    {
+      goldenSnapshotStatus: {
+        errorMessage: "warmup failed",
+        goldenTag: { atespace: "ate-golden", name: "golden" },
+      },
+      phase: "Failed",
+    },
+  ])(
+    "derives template phase $phase from upstream status",
+    async ({ goldenSnapshotStatus, phase }) => {
+      serve(({ service }) => {
+        service(SystemService, {
+          getSubstrateSummary: () => ({
+            actorTemplates: [
+              {
+                metadata: { atespace: "kagent", name: "tpl" },
+                status: { goldenSnapshotStatus },
+              },
+            ],
+          }),
+        });
+      });
+      const { actorTemplates } = await apiClient.substrate.summary();
+      expect(actorTemplates[0].phase).toBe(phase);
+      expect(actorTemplates[0].workerSelector).toBeUndefined();
+    },
+  );
+
+  it.each([
+    [ActorState.UNSPECIFIED, "Unknown"],
+    [ActorState.RESUMING, "Resuming"],
+    [ActorState.RUNNING, "Running"],
+    [ActorState.SUSPENDING, "Suspending"],
+    [ActorState.SUSPENDED, "Suspended"],
+    [ActorState.PAUSING, "Pausing"],
+    [ActorState.PAUSED, "Paused"],
+    [ActorState.CRASHED, "ACTOR_STATE_CRASHED"],
+    [ActorState.DELETING, "ACTOR_STATE_DELETING"],
+    [ActorState.REVERTING, "Reverting"],
+    [99 as ActorState, "99"],
+  ])("preserves the actor status label for state %s", async (state, label) => {
+    serve(({ service }) => {
+      service(SystemService, {
+        listSubstrateActors: () => ({
+          actors: [{ metadata: { name: "a1" }, status: { state } }],
+        }),
+      });
+    });
+    const page = await apiClient.substrate.actors({});
+    expect(page.actors[0].status).toBe(label);
+  });
+
+  it("rejects worker pools without a resource instead of displaying empty columns", async () => {
+    const inventory = () => ({
+      workerPools: [{ ref: { namespace: "kagent", name: "pool" } }],
+    });
+    serve(({ service }) => {
+      service(SystemService, { getSubstrateSummary: inventory });
+    });
+    await expect(apiClient.substrate.summary()).rejects.toMatchObject({ kind: "parse" });
   });
 
   // Proto3 cannot tell an unset string from an empty one, and an empty warning
@@ -396,26 +549,145 @@ describe("the cluster", () => {
   it("reads an empty warning as no warning", async () => {
     serve(({ service }) => {
       service(SystemService, {
-        getSubstrateStatus: () => ({ enabled: false, ateApiError: "" }),
+        getSubstrateSummary: () => ({ ateApiError: "" }),
       });
     });
-    expect((await apiClient.substrate.status()).ateApiError).toBeUndefined();
+    expect((await apiClient.substrate.summary()).ateApiError).toBeUndefined();
   });
 
-  it("passes the namespace filter through", async () => {
-    const asked: string[] = [];
+  it("passes independent namespace and atespace filters through", async () => {
+    const asked: { namespace: string; atespace: string }[] = [];
     serve(({ service }) => {
       service(SystemService, {
-        getSubstrateStatus: (request) => {
-          asked.push(request.namespace);
-          return { enabled: true };
+        getSubstrateSummary: (request) => {
+          asked.push({ namespace: request.namespace, atespace: request.atespace });
+          return {};
         },
       });
     });
 
-    await apiClient.substrate.status("kagent");
-    await apiClient.substrate.status();
-    expect(asked).toEqual(["kagent", ""]);
+    await apiClient.substrate.summary({ namespace: "kagent", atespace: "team-a" });
+    await apiClient.substrate.summary();
+    expect(asked).toEqual([{ namespace: "kagent", atespace: "team-a" }, { namespace: "", atespace: "" }]);
+  });
+
+  it("reads the summary's counts rather than counting rows", async () => {
+    serve(({ service }) => {
+      service(SystemService, {
+        getSubstrateSummary: () => ({
+          workerPools: [
+            {
+              ref: { namespace: "kagent", name: "pool" },
+              resource: {
+                apiVersion: "ate.dev/v1alpha1", kind: "WorkerPool",
+                value: {
+                  metadata: { namespace: "kagent", name: "pool" },
+                  spec: { replicas: 2, workerImage: "ateom:1" },
+                  status: { replicas: 1, readyReplicas: 1 },
+                },
+              },
+            },
+          ],
+          actorTemplates: [
+            {
+              metadata: { atespace: "kagent", name: "tpl", uid: "golden-actor" },
+              status: {
+                goldenSnapshotStatus: {
+                  goldenTag: { atespace: "ate-golden", name: "golden" },
+                },
+              },
+              sandboxConfig: { sandboxClass: SandboxClass.GVISOR },
+              workerSelector: { matchLabels: { zone: "east", pool: "agents" } },
+            },
+          ],
+          actorCount: 410110n,
+          workerCount: 900n,
+          runningActorCount: 12n,
+          busyWorkerCount: 11n,
+          actorStatusCounts: [
+            { state: ActorState.CRASHED, count: 410098n },
+            { state: ActorState.RUNNING, count: 12n },
+          ],
+          computedAt: timestampFromDate(new Date("2026-09-04T12:00:00Z")),
+        }),
+      });
+    });
+
+    const summary = await apiClient.substrate.summary();
+    // `int64` on the wire: a count that stayed a bigint formats as "410110n" and
+    // arithmetic against it throws.
+    expect(summary.workerPools).toEqual([{ namespace: "kagent", name: "pool", replicas: 2, ateomImage: "ateom:1" }]);
+    expect(summary.actorTemplates[0].phase).toBe("Ready");
+    expect(summary.actorCount).toBe(410110);
+    expect(summary.runningActorCount).toBe(12);
+    expect(summary.busyWorkerCount).toBe(11);
+    expect(summary.actorStatusCounts).toEqual([
+      { status: "ACTOR_STATE_CRASHED", count: 410098 },
+      { status: "Running", count: 12 },
+    ]);
+    expect(summary.computedAt).toBe("2026-09-04T12:00:00.000Z");
+  });
+
+  // `PageRequest`/`PageResponse`, the shape every other paged read on this API uses.
+  it("sends the page size and token, and reads the next token back", async () => {
+    const asked: {
+      atespace: string;
+      limit: number;
+      pageToken: string;
+    }[] = [];
+    serve(({ service }) => {
+      service(SystemService, {
+        listSubstrateActors: (request) => {
+          asked.push({
+            atespace: request.atespace,
+            limit: request.page?.limit ?? 0,
+            pageToken: request.page?.pageToken ?? "",
+          });
+          return {
+            actors: [{
+              metadata: { name: "a1", version: 3n },
+              status: { state: ActorState.RUNNING },
+            }],
+            page: { nextPageToken: "cursor-2" },
+          };
+        },
+      });
+    });
+
+    const page = await apiClient.substrate.actors({
+      atespace: "kagent",
+      limit: 100,
+      pageToken: "cursor-1",
+    });
+    expect(asked).toEqual([
+      {
+        atespace: "kagent",
+        limit: 100,
+        pageToken: "cursor-1",
+      },
+    ]);
+    expect(page.actors[0].actorId).toBe("a1");
+    expect(page.actors[0].status).toBe("Running");
+    expect(page.actors[0].version).toBe(3);
+    expect(page.actors[0].ateomPodName).toBeUndefined();
+    expect(page.nextPageToken).toBe("cursor-2");
+  });
+
+  // Absent rather than empty, so "there is more" is a question about presence: an
+  // empty token sent back as the next page would re-read page one for ever.
+  it("reads the last page's empty token as no next page", async () => {
+    serve(({ service }) => {
+      service(SystemService, {
+        listSubstrateWorkers: () => ({
+          workers: [{ workerNamespace: "kagent", workerPool: "pool", workerPod: "w0" }],
+          page: { nextPageToken: "" },
+        }),
+      });
+    });
+
+    const page = await apiClient.substrate.workers({ limit: 100 });
+    expect(page.nextPageToken).toBeUndefined();
+    expect(page.workers).toHaveLength(1);
   });
 });
 
@@ -497,14 +769,13 @@ describe("agent instances", () => {
   function instanceMessage(overrides: Record<string, unknown> = {}) {
     return {
       id: INSTANCE_ID,
-      contextId: "distinct-a2a-context",
+      contextId: INSTANCE_ID,
       creator: "alice@example.com",
-      harness: { namespace: "kagent", name: "k8s-agent" },
-      agentTemplate: { namespace: "kagent", name: "k8s-agent-7f3a91c" },
+      agent: { namespace: "kagent", name: "k8s-agent-7f3a91c" },
       preparedRevision: "rev-7f3a91c",
       a2aAuthority: "k8s-agent.kagent.svc:8080",
-      state: PbAgentInstanceState.READY,
-      operation: PbAgentInstanceOperation.UNSPECIFIED,
+      state: RuntimeState.READY,
+      operation: RuntimeOperation.NONE,
       createdAt: { seconds: 1767225600n, nanos: 0 },
       updatedAt: { seconds: 1767225600n, nanos: 0 },
       ...overrides,
@@ -513,14 +784,14 @@ describe("agent instances", () => {
 
   it("reads the two enums as words, and the refs as namespace/name", async () => {
     serve(({ service }) => {
-      service(AgentInstanceService, {
-        listAgentInstances: () => ({
-          agentInstances: [
+      service(SessionService, {
+        listSessions: () => ({
+          sessions: [
             instanceMessage(),
             instanceMessage({
               id: "b28e4f13-5c66-4d90-8f2b-77a1e9c34d05",
-              state: PbAgentInstanceState.SUSPENDED,
-              operation: PbAgentInstanceOperation.RESUME,
+              state: RuntimeState.SUSPENDED,
+              operation: RuntimeOperation.RESUME,
             }),
           ],
           page: {},
@@ -533,11 +804,10 @@ describe("agent instances", () => {
     const ready = rows.find((row) => row.id === INSTANCE_ID);
     const suspended = rows.find((row) => row.id.startsWith("b28e"));
 
-    expect(ready?.contextId).toBe("distinct-a2a-context");
+    expect(ready?.contextId).toBe(INSTANCE_ID);
     expect(ready?.state).toBe("ready");
     expect(ready?.operation).toBe("unspecified");
-    expect(ready?.harness).toBe("kagent/k8s-agent");
-    expect(ready?.agentTemplate).toBe("kagent/k8s-agent-7f3a91c");
+    expect(ready?.agent).toBe("kagent/k8s-agent-7f3a91c");
     expect(ready?.createdAt).toBe("2026-01-01T00:00:00.000Z");
 
     expect(suspended?.state).toBe("suspended");
@@ -552,12 +822,12 @@ describe("agent instances", () => {
    */
   it("names an enum value it does not recognise rather than dropping it", async () => {
     serve(({ service }) => {
-      service(AgentInstanceService, {
-        listAgentInstances: () => ({
+      service(SessionService, {
+        listSessions: () => ({
           // 99 is not a member of either enum. Cast because the generated type
           // describes the proto this build compiled against, which is exactly the
           // assumption under test.
-          agentInstances: [
+          sessions: [
             instanceMessage({ state: 99, operation: 98 } as Record<string, unknown>),
           ],
           page: {},
@@ -577,17 +847,16 @@ describe("agent instances", () => {
    */
   it("reports an unset field as absent rather than as an empty string", async () => {
     serve(({ service }) => {
-      service(AgentInstanceService, {
-        listAgentInstances: () => ({
-          agentInstances: [
+      service(SessionService, {
+        listSessions: () => ({
+          sessions: [
             instanceMessage({
-              harness: undefined,
-              agentTemplate: undefined,
+              agent: undefined,
               preparedRevision: "",
               a2aAuthority: "",
               createdAt: undefined,
-              state: PbAgentInstanceState.CREATING,
-              operation: PbAgentInstanceOperation.CREATE,
+              state: RuntimeState.CREATING,
+              operation: RuntimeOperation.CREATE,
             }),
           ],
           page: {},
@@ -596,8 +865,7 @@ describe("agent instances", () => {
     });
 
     const [row] = await apiClient.agentInstances.list();
-    expect(row.harness).toBeUndefined();
-    expect(row.agentTemplate).toBeUndefined();
+    expect(row.agent).toBeUndefined();
     expect(row.preparedRevision).toBeUndefined();
     expect(row.a2aAuthority).toBeUndefined();
     expect(row.createdAt).toBe("");
@@ -606,11 +874,11 @@ describe("agent instances", () => {
 
   it("keeps a failure the controller sent with nothing in it", async () => {
     serve(({ service }) => {
-      service(AgentInstanceService, {
-        listAgentInstances: () => ({
-          agentInstances: [
+      service(SessionService, {
+        listSessions: () => ({
+          sessions: [
             instanceMessage({
-              state: PbAgentInstanceState.FAILED,
+              state: RuntimeState.FAILED,
               // Present, and empty. The message being there is the only signal that
               // something went wrong, so the presence must survive the conversion
               // even when neither half has any text in it.
@@ -635,17 +903,17 @@ describe("agent instances", () => {
   it("follows the page token until the controller stops handing one back", async () => {
     const tokensSeen: string[] = [];
     serve(({ service }) => {
-      service(AgentInstanceService, {
-        listAgentInstances: (request) => {
+      service(SessionService, {
+        listSessions: (request) => {
           tokensSeen.push(request.page?.pageToken ?? "");
           if (!request.page?.pageToken) {
             return {
-              agentInstances: [instanceMessage()],
+              sessions: [instanceMessage()],
               page: { nextPageToken: "page-2" },
             };
           }
           return {
-            agentInstances: [
+            sessions: [
               instanceMessage({ id: "b28e4f13-5c66-4d90-8f2b-77a1e9c34d05" }),
             ],
             page: {},
@@ -666,9 +934,9 @@ describe("agent instances", () => {
    */
   it("refuses a page token that does not advance", async () => {
     serve(({ service }) => {
-      service(AgentInstanceService, {
-        listAgentInstances: () => ({
-          agentInstances: [instanceMessage()],
+      service(SessionService, {
+        listSessions: () => ({
+          sessions: [instanceMessage()],
           page: { nextPageToken: "stuck" },
         }),
       });
@@ -682,10 +950,10 @@ describe("agent instances", () => {
   it("asks for other people's instances only when told to", async () => {
     const asked: boolean[] = [];
     serve(({ service }) => {
-      service(AgentInstanceService, {
-        listAgentInstances: (request) => {
+      service(SessionService, {
+        listSessions: (request) => {
           asked.push(request.allCreators);
-          return { agentInstances: [], page: {} };
+          return { sessions: [], page: {} };
         },
       });
     });
@@ -698,13 +966,13 @@ describe("agent instances", () => {
   it("addresses one instance by id, and reports a missing one as a 404", async () => {
     const asked: { id: string }[] = [];
     serve(({ service }) => {
-      service(AgentInstanceService, {
-        getAgentInstance: (request) => {
-          asked.push({ id: request.agentInstanceId });
-          if (request.agentInstanceId !== INSTANCE_ID) {
+      service(SessionService, {
+        getSession: (request) => {
+          asked.push({ id: request.sessionId });
+          if (request.sessionId !== INSTANCE_ID) {
             throw new ConnectError("no such instance", Code.NotFound);
           }
-          return { agentInstance: instanceMessage() };
+          return { session: instanceMessage() };
         },
       });
     });
@@ -727,16 +995,16 @@ describe("agent instances", () => {
   it("suspends and resumes through their own RPCs, answering with the new state", async () => {
     const called: string[] = [];
     serve(({ service }) => {
-      service(AgentInstanceService, {
-        suspendAgentInstance: (request) => {
-          called.push(`suspend ${request.agentInstanceId}`);
+      service(SessionService, {
+        suspendSession: (request) => {
+          called.push(`suspend ${request.sessionId}`);
           return {
-            agentInstance: instanceMessage({ state: PbAgentInstanceState.SUSPENDED }),
+            session: instanceMessage({ state: RuntimeState.SUSPENDED }),
           };
         },
-        resumeAgentInstance: (request) => {
-          called.push(`resume ${request.agentInstanceId}`);
-          return { agentInstance: instanceMessage({ state: PbAgentInstanceState.READY }) };
+        resumeSession: (request) => {
+          called.push(`resume ${request.sessionId}`);
+          return { session: instanceMessage({ state: RuntimeState.READY }) };
         },
       });
     });
@@ -761,8 +1029,8 @@ describe("agent instances", () => {
    */
   it("passes a refused lifecycle operation through as the error it was", async () => {
     serve(({ service }) => {
-      service(AgentInstanceService, {
-        suspendAgentInstance: () => {
+      service(SessionService, {
+        suspendSession: () => {
           throw new ConnectError(
             "AgentInstance has a conflicting lifecycle operation",
             Code.Aborted,
@@ -779,7 +1047,7 @@ describe("agent instances", () => {
     expect((failure as ApiError).code).toBe("Aborted");
     expect((failure as ApiError).message).toMatch(/conflicting lifecycle operation/);
     expect((failure as ApiError).url).toBe(
-      "AgentInstanceService/SuspendAgentInstance",
+      "SessionService/SuspendSession",
     );
   });
 });

@@ -37,12 +37,12 @@ import type { ResourceReference, StructuredObject } from "@/generated/kagent/api
  *
  * Note that this is *not* the version in the proto package. The gRPC surface is
  * `kagent.api.v1alpha1` and the custom resources it carries are
- * `kagent.dev/v1alpha3`, so the two version numbers in play are deliberately
+ * `api.kagent.dev/v1alpha3`, so the two version numbers in play are deliberately
  * different: one versions the transport API, the other versions the CRDs travelling
  * inside it. Reading a `v1alpha1` import beside a `v1alpha3` payload looks like a
  * mistake and is not one.
  */
-export const KAGENT_API_VERSION = "kagent.dev/v1alpha3";
+export const KAGENT_API_VERSION = "api.kagent.dev/v1alpha3";
 
 /** A missing collection is an empty one — an absent list is not an error. */
 export function list<T>(items: readonly T[] | undefined): T[] {
@@ -116,15 +116,23 @@ export function isoFrom(timestamp: Timestamp | undefined): string {
  * reader can check the list against the schemas rather than trust it — regenerate it
  * with, from the repository root:
  *
- *   awk '/^message /{m=$2} /int64|uint64/{print FILENAME":"NR" "m}' \
+ *   awk '/^message /{m=$2} /int64|uint64/{print FILENAME":"FNR" "m}' \
  *     proto/kagent/api/v1alpha1/*.proto
  *
- * - `system.proto:85`   — `SubstrateActor.version`     (reached by `substrate.status`)
- * - `system.proto:96`   — `SubstrateWorker.version`    (reached by `substrate.status`)
+ * `FNR`, not `NR`: `NR` keeps counting across files, so every line number after the
+ * first schema comes out wrong — which is how this list drifted last time.
+ *
+ * - `ateapi.proto`      — `ResourceMetadata.version`  (reached by `substrate.actors`)
+ * - `ateapi.proto`      — `Worker.metadata.version`    (reached by `substrate.workers`)
+ * - `system.proto`  — `SubstrateActorStatusCount.count`      (`substrate.summary`)
+ * - `system.proto`  — `GetSubstrateSummaryResponse.actor_count`         (the same)
+ * - `system.proto`  — `GetSubstrateSummaryResponse.worker_count`        (the same)
+ * - `system.proto`  — `GetSubstrateSummaryResponse.running_actor_count` (the same)
+ * - `system.proto`  — `GetSubstrateSummaryResponse.busy_worker_count`   (the same)
  * - `memory.proto:38`   — `MemorySummary.access_count` (no operation id yet)
  * - `checkpoints.proto:32` — `Checkpoint.history_sequence` (no operation id yet)
  *
- * The last five have no operation behind them today. They are listed anyway: the
+ * The last two have no operation behind them today. They are listed anyway: the
  * moment one gets an id, this is the helper its conversion needs, and a list that
  * only covered what happens to be wired is a list that goes stale silently.
  */

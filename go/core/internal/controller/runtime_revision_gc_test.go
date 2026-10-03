@@ -12,16 +12,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRuntimeRevisionGCRejectsInvalidInterval(t *testing.T) {
+	for _, interval := range []time.Duration{0, -time.Second} {
+		t.Run(interval.String(), func(t *testing.T) {
+			require.ErrorContains(t, NewRuntimeRevisionGC(nil, nil, interval).Start(t.Context()), "interval must be positive")
+		})
+	}
+}
+
 func TestRuntimeRevisionGCStart(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		store := &fakeGCStore{revisions: []database.RuntimeRevision{
+		store := &fakeGCStore{revisions: []database.RuntimeArtifact{
 			{Revision: "failed", ActorTemplateName: "failed"},
 			{Revision: "healthy", ActorTemplateName: "healthy"},
 		}, listErr: errors.New("database unavailable")}
 		templates := &fakeGCTemplates{deleteErr: errors.New("Substrate unavailable")}
-		collector := NewRuntimeRevisionGC(store, templates)
+		collector := NewRuntimeRevisionGC(store, templates, 20*time.Minute)
 		require.True(t, collector.NeedLeaderElection())
 		done := make(chan error, 1)
 		go func() { done <- collector.Start(ctx) }()
@@ -29,9 +37,15 @@ func TestRuntimeRevisionGCStart(t *testing.T) {
 		store.mu.Lock()
 		require.Equal(t, 1, store.lists, "startup must sweep immediately")
 
+		store.mu.Unlock()
+		time.Sleep(19 * time.Minute)
+		synctest.Wait()
+		store.mu.Lock()
+		require.Equal(t, 1, store.lists, "must not query before the configured interval")
+
 		store.listErr = nil
 		store.mu.Unlock()
-		time.Sleep(runtimeRevisionGCInterval)
+		time.Sleep(time.Minute)
 		synctest.Wait()
 		store.mu.Lock()
 		require.Equal(t, []string{"healthy"}, store.deleted, "a failed candidate must not block later candidates")
@@ -40,7 +54,7 @@ func TestRuntimeRevisionGCStart(t *testing.T) {
 		templates.mu.Lock()
 		templates.deleteErr = nil
 		templates.mu.Unlock()
-		time.Sleep(runtimeRevisionGCInterval)
+		time.Sleep(20 * time.Minute)
 		synctest.Wait()
 		store.mu.Lock()
 		require.Equal(t, []string{"healthy", "failed"}, store.deleted, "periodic sweeps must retry without template events")
@@ -54,12 +68,12 @@ func TestRuntimeRevisionGCDeadlineAndCancellation(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		store := &fakeGCStore{revisions: []database.RuntimeRevision{
+		store := &fakeGCStore{revisions: []database.RuntimeArtifact{
 			{Revision: "failed", ActorTemplateName: "failed"},
 			{Revision: "healthy", ActorTemplateName: "healthy"},
 		}}
 		templates := &fakeGCTemplates{block: true}
-		collector := NewRuntimeRevisionGC(store, templates)
+		collector := NewRuntimeRevisionGC(store, templates, time.Minute)
 		done := make(chan error, 1)
 		go func() { done <- collector.Start(ctx) }()
 		synctest.Wait()
@@ -76,20 +90,20 @@ func TestRuntimeRevisionGCDeadlineAndCancellation(t *testing.T) {
 
 type fakeGCStore struct {
 	mu        sync.Mutex
-	revisions []database.RuntimeRevision
+	revisions []database.RuntimeArtifact
 	listErr   error
 	lists     int
 	deleted   []string
 }
 
-func (s *fakeGCStore) ListUnreferencedRuntimeRevisions(context.Context) ([]database.RuntimeRevision, error) {
+func (s *fakeGCStore) ListUnreferencedRuntimeRevisions(context.Context) ([]database.RuntimeArtifact, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lists++
 	return s.revisions, s.listErr
 }
 
-func (s *fakeGCStore) BeginRuntimeRevisionDeletion(_ context.Context, id string) (*database.RuntimeRevision, error) {
+func (s *fakeGCStore) BeginRuntimeRevisionDeletion(_ context.Context, id string) (*database.RuntimeArtifact, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, revision := range s.revisions {
@@ -120,7 +134,7 @@ type fakeGCTemplates struct {
 	block     bool
 }
 
-func (f *fakeGCTemplates) DeleteActorTemplate(ctx context.Context, _, name, _ string) error {
+func (f *fakeGCTemplates) DeleteActorTemplate(ctx context.Context, _, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if name == "failed" {
