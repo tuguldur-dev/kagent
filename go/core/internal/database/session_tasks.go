@@ -13,9 +13,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	apia2a "github.com/kagent-dev/kagent/go/api/a2a"
-	apiv1alpha1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1alpha1"
 	"google.golang.org/protobuf/proto"
+
+	apia2a "github.com/kagent-dev/kagent/go/api/a2a"
+	apiv1 "github.com/kagent-dev/kagent/go/api/gen/kagent/api/v1"
 )
 
 // ErrDispatchBusy means a send has not been forwarded because another dispatch
@@ -129,7 +130,7 @@ func (c *Client) writeRuntimeTask(ctx context.Context, sessionID string, expecte
 		if err != nil {
 			return notFoundOr(err)
 		}
-		if session.State == apiv1alpha1.RuntimeState_RUNTIME_STATE_DELETED.String() {
+		if session.State == apiv1.RuntimeState_RUNTIME_STATE_DELETED.String() {
 			return ErrNotFound
 		}
 		if task.ContextID != session.ContextID.String() {
@@ -224,6 +225,9 @@ func (c *Client) writeRuntimeTask(ctx context.Context, sessionID string, expecte
 			}
 		}
 		if err := storeSessionTaskEvent(ctx, tx, session, task, event, boundary); err != nil {
+			return err
+		}
+		if err := bindInitialPushForTask(ctx, tx, session.HistoryID, string(task.ID)); err != nil {
 			return err
 		}
 		version, err = taskVersion(ctx, tx, session.HistoryID, string(task.ID))
